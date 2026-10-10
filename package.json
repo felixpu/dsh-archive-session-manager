@@ -1,0 +1,53 @@
+{
+  "name": "dsh-archive-session-manager",
+  "version": "0.1.0",
+  "description": "归档会话管理：在会话「···」菜单中为已归档会话提供「删除会话」，并提供一个归档会话管理面板（多选、批量删除、批量取消归档）。",
+  "icon": "icon.svg",
+  "type": "module",
+  "main": "lib/index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/felixpu/dsh-archive-session-manager.git"
+  },
+  "homepage": "https://github.com/felixpu/dsh-archive-session-manager#readme",
+  "bugs": {
+    "url": "https://github.com/felixpu/dsh-archive-session-manager/issues"
+  },
+  "author": "felixpu",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client",
+    "cordis.patch.yml",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "session",
+    "archive",
+    "delete"
+  ],
+  "license": "MIT"
+}

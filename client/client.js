@@ -1,0 +1,396 @@
+// dsh-archive-session-manager —— 归档会话管理的**浏览器半身**。
+//
+// 三个 UI 落点（契约均经 cordis_inspect_query 实时核对，非猜测）：
+//
+// 1) 单个删除入口 = `sidebar.workspaces.session.menu.item` 槽（会话「···」菜单）。
+//    官方注册了 pin(100)/rename(200)/fork(300)/archive(400)，本插件以 order 500
+//    追加「删除会话」，且**仅当该行会话在归档集合中时渲染**。
+//    ownerProps: { sessionId, displayTitle }；菜单状态经注入的 useMenuOpenState 关闭。
+//    归档判定用 standardProps 的 useWorkspaces（快照含 archivedSessionIds），
+//    与官方 ArchiveSessionMenuItem 的 useArchived 同源（都是 workspaces.list 的 derive）。
+//
+// 2) 批量管理入口 = `sidebar.footer.action` 槽（侧栏底部，紧挨设置）。
+//
+// 3) 确认对话框 + 批量管理面板 = `shell.overlay` 槽（全屏浮层，click-through，
+//    条目需自行 opt-in pointer events）。
+//
+// ⚠️ 只允许 require 平台种子表 9 项内的模块；slots 服务走 package.json
+//    里 dsh.client.inject 声明的 "@deepseek-ai/dsh-client-ui-slots"。
+window.__ModuleLoader__.load({
+  id: 'dsh-archive-session-manager',
+  factory(require) {
+    var React = require('react');
+    var h = React.createElement;
+    var Primitives = require('@deepseek-ai/dsh-client-ui-primitives');
+
+    var API = '/api/dsh-archive-session-manager';
+
+    // ---- 样式（只用 Theme.listTokens 实报的 --dsw-* token，明暗自动切换）----
+    var CSS = [
+      '.asm-veil{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;',
+      'background:color-mix(in srgb,var(--dsw-alias-bg-base) 72%,transparent);pointer-events:auto;padding:24px}',
+      '.asm-card{display:flex;flex-direction:column;gap:14px;padding:22px;border-radius:14px;pointer-events:auto;',
+      'border:.5px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);',
+      'box-shadow:0 12px 40px color-mix(in srgb,var(--dsw-alias-label-primary) 12%,transparent)}',
+      '.asm-card-confirm{width:100%;max-width:400px}',
+      '.asm-card-panel{width:100%;max-width:560px;max-height:80vh}',
+      '.asm-title{margin:0;font-size:15px;font-weight:600;color:var(--dsw-alias-label-primary)}',
+      '.asm-desc{margin:0;font-size:13px;line-height:1.6;color:var(--dsw-alias-label-secondary)}',
+      '.asm-desc strong{color:var(--dsw-alias-label-primary)}',
+      '.asm-warn{color:var(--dsw-alias-state-error-primary)}',
+      '.asm-row-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:2px}',
+      '.asm-btn{font-size:13px;padding:7px 14px;border-radius:8px;border:.5px solid var(--dsw-alias-border-l1);cursor:pointer;',
+      'background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}',
+      '.asm-btn:hover{border-color:var(--dsw-alias-border-l2)}',
+      '.asm-btn:disabled{opacity:.5;cursor:not-allowed}',
+      '.asm-btn-danger{background:var(--dsw-alias-state-error-primary);border-color:transparent;color:var(--dsw-alias-bg-base)}',
+      '.asm-btn-primary{background:var(--dsw-alias-brand-primary);border-color:transparent;color:var(--dsw-alias-bg-base)}',
+      '.asm-list{flex:1;min-height:120px;overflow-y:auto;display:flex;flex-direction:column;gap:2px;margin:0 -6px;padding:0 6px}',
+      '.asm-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;cursor:pointer}',
+      '.asm-item:hover{background:var(--dsw-alias-bg-layer-2)}',
+      '.asm-item input{flex:none;accent-color:var(--dsw-alias-brand-primary)}',
+      '.asm-item-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}',
+      '.asm-item-title{font-size:13px;color:var(--dsw-alias-label-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '.asm-item-meta{font-size:11px;color:var(--dsw-alias-label-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '.asm-item-bytes{flex:none;font-size:11px;color:var(--dsw-alias-label-secondary)}',
+      '.asm-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px}',
+      '.asm-toolbar-label{font-size:12px;color:var(--dsw-alias-label-secondary)}',
+      '.asm-empty{padding:32px 0;text-align:center;font-size:13px;color:var(--dsw-alias-label-secondary)}',
+      '.asm-footer{display:flex;align-items:center;justify-content:space-between;gap:8px;border-top:.5px solid var(--dsw-alias-border-l1);padding-top:12px}',
+      '.asm-status{font-size:12px;color:var(--dsw-alias-label-secondary)}',
+      '.asm-status-err{color:var(--dsw-alias-state-error-primary)}',
+    ].join('\n');
+
+    function useCss() {
+      React.useEffect(function () {
+        if (document.head.querySelector('style[data-plugin-css="dsh-archive-session-manager"]')) return undefined;
+        var el = document.createElement('style');
+        el.setAttribute('data-plugin-css', 'dsh-archive-session-manager');
+        el.textContent = CSS;
+        document.head.appendChild(el);
+        return function () { el.remove(); };
+      }, []);
+    }
+
+    // ---- 全局 UI 状态（模块级 store + 简单订阅）----
+    var listeners = new Set();
+    var uiState = {
+      confirm: null,   // { sessionId, displayTitle }
+      panelOpen: false,
+    };
+    function setUi(patch) {
+      uiState = Object.assign({}, uiState, patch);
+      listeners.forEach(function (fn) { fn(); });
+    }
+    function useUi() {
+      var sub = React.useSyncExternalStore(
+        function (fn) { listeners.add(fn); return function () { listeners.delete(fn); }; },
+        function () { return uiState; },
+        function () { return uiState; }
+      );
+      return sub;
+    }
+
+    async function apiList() {
+      var res = await fetch(API + '/list', { credentials: 'same-origin' });
+      if (!res.ok) throw new Error('list http ' + res.status);
+      return res.json();
+    }
+    async function apiDelete(sessionIds) {
+      var res = await fetch(API + '/delete', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionIds: sessionIds }),
+      });
+      if (!res.ok) throw new Error('delete http ' + res.status);
+      return res.json();
+    }
+
+    function formatBytes(n) {
+      if (n === null || n === undefined) return '';
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      return (n / 1024 / 1024).toFixed(1) + ' MB';
+    }
+    function formatTime(ms) {
+      if (!ms) return '';
+      try {
+        return new Date(ms).toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+      } catch { return ''; }
+    }
+
+    // ---- 1) 菜单行：删除会话（仅归档行可见）----
+    // props：ownerProps { sessionId, displayTitle } + slotInject { useMenuOpenState }
+    //        + standardProps { useWorkspaces }
+    function DeleteSessionMenuItem(props) {
+      var sessionId = props.sessionId;
+      var displayTitle = props.displayTitle;
+      var setMenuOpen = props.useMenuOpenState ? props.useMenuOpenState()[1] : function () {};
+      // 归档集合判定：useWorkspaces 是 SnapshotSelectorHook，选择 archivedSessionIds。
+      var archived = false;
+      try {
+        if (props.useWorkspaces) {
+          archived = !!props.useWorkspaces(function (snap) {
+            var ids = snap && snap.archivedSessionIds;
+            return ids && ids.indexOf(sessionId) !== -1;
+          });
+        }
+      } catch { archived = false; }
+      if (!archived) return null;
+
+      var Icon = Primitives.IconTrashOutlineRegular;
+      return h(Primitives.MenuItemButton, {
+        icon: Icon ? h(Icon, { size: 14 }) : undefined,
+        onSelect: function () {
+          setMenuOpen(false);
+          setUi({ confirm: { sessionId: sessionId, displayTitle: displayTitle || sessionId } });
+        },
+      }, '删除会话');
+    }
+
+    // ---- 2) 单个删除确认对话框 ----
+    function ConfirmDeleteDialog() {
+      useCss();
+      var ui = useUi();
+      var pending = ui.confirm;
+      var _busy = React.useState(false), busy = _busy[0], setBusy = _busy[1];
+      var _err = React.useState(''), err = _err[0], setErr = _err[1];
+      if (!pending) return null;
+
+      function close() { if (!busy) { setErr(''); setUi({ confirm: null }); } }
+      async function doDelete() {
+        setBusy(true); setErr('');
+        try {
+          var out = await apiDelete([pending.sessionId]);
+          var r = out.results && out.results[0];
+          if (r && r.ok) {
+            setUi({ confirm: null });
+          } else {
+            setErr('删除失败：' + ((r && r.error) || '未知错误'));
+          }
+        } catch (e) {
+          setErr('删除失败：' + String(e && e.message || e));
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      return h('div', { className: 'asm-veil', onClick: close },
+        h('div', { className: 'asm-card asm-card-confirm', onClick: function (e) { e.stopPropagation(); } },
+          h('p', { className: 'asm-title' }, '删除归档会话'),
+          h('p', { className: 'asm-desc' },
+            '将永久删除会话 ',
+            h('strong', null, '「' + pending.displayTitle + '」'),
+            ' 的全部记录（磁盘上的会话日志），此操作不可恢复。'),
+          err ? h('p', { className: 'asm-desc asm-warn' }, err) : null,
+          h('div', { className: 'asm-row-actions' },
+            h('button', { type: 'button', className: 'asm-btn', onClick: close, disabled: busy }, '取消'),
+            h('button', { type: 'button', className: 'asm-btn asm-btn-danger', onClick: doDelete, disabled: busy },
+              busy ? '删除中…' : '永久删除'))));
+    }
+
+    // ---- 3) 批量管理面板 ----
+    function ArchiveManagerPanel() {
+      useCss();
+      var ui = useUi();
+      var _items = React.useState(null), items = _items[0], setItems = _items[1];
+      var _sel = React.useState({}), sel = _sel[0], setSel = _sel[1];
+      var _status = React.useState(null), status = _status[0], setStatus = _status[1]; // { kind:'info'|'err', text }
+      var _busy = React.useState(false), busy = _busy[0], setBusy = _busy[1];
+      var _confirming = React.useState(false), confirming = _confirming[0], setConfirming = _confirming[1];
+
+      var open = ui.panelOpen;
+      React.useEffect(function () {
+        if (!open) return;
+        var cancelled = false;
+        setItems(null); setSel({}); setStatus(null); setConfirming(false);
+        apiList().then(function (out) {
+          if (!cancelled) setItems(out.sessions || []);
+        }).catch(function (e) {
+          if (!cancelled) { setItems([]); setStatus({ kind: 'err', text: '列表加载失败：' + String(e && e.message || e) }); }
+        });
+        return function () { cancelled = true; };
+      }, [open]);
+
+      if (!open) return null;
+
+      function close() { if (!busy) setUi({ panelOpen: false }); }
+      var selectedIds = Object.keys(sel).filter(function (k) { return sel[k]; });
+      var allSelected = items && items.length > 0 && selectedIds.length === items.length;
+
+      function toggleAll() {
+        if (!items) return;
+        if (allSelected) setSel({});
+        else {
+          var next = {};
+          items.forEach(function (s) { next[s.sessionId] = true; });
+          setSel(next);
+        }
+      }
+      function toggleOne(id) {
+        setSel(function (prev) {
+          var next = Object.assign({}, prev);
+          next[id] = !prev[id];
+          return next;
+        });
+      }
+
+      async function doBatchDelete() {
+        setBusy(true); setStatus(null);
+        try {
+          var out = await apiDelete(selectedIds);
+          var okIds = new Set();
+          var failures = [];
+          (out.results || []).forEach(function (r) {
+            if (r.ok) okIds.add(r.sessionId); else failures.push(r.error);
+          });
+          setItems(function (prev) { return (prev || []).filter(function (s) { return !okIds.has(s.sessionId); }); });
+          setSel({}); setConfirming(false);
+          var freed = formatBytes(out.deletedBytes);
+          setStatus(failures.length === 0
+            ? { kind: 'info', text: '已删除 ' + okIds.size + ' 个会话' + (freed ? '，释放 ' + freed : '') }
+            : { kind: 'err', text: '已删除 ' + okIds.size + ' 个，失败 ' + failures.length + ' 个：' + failures[0] });
+        } catch (e) {
+          setStatus({ kind: 'err', text: '批量删除失败：' + String(e && e.message || e) });
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function doBatchUnarchive() {
+        setBusy(true); setStatus(null);
+        var done = 0, failed = 0;
+        for (var i = 0; i < selectedIds.length; i++) {
+          try {
+            // 平台官方 Remote：workspaces.unarchiveSession（与「取消归档」菜单同一通路）。
+            await window.__dsh_archive_manager_unarchive(selectedIds[i]);
+            done++;
+          } catch { failed++; }
+        }
+        setItems(function (prev) { return (prev || []).filter(function (s) { return selectedIds.indexOf(s.sessionId) === -1; }); });
+        setSel({});
+        setStatus(failed === 0
+          ? { kind: 'info', text: '已取消归档 ' + done + ' 个会话' }
+          : { kind: 'err', text: '完成 ' + done + ' 个，失败 ' + failed + ' 个' });
+        setBusy(false);
+      }
+
+      var body;
+      if (items === null) {
+        body = h('div', { className: 'asm-empty' }, '加载中…');
+      } else if (items.length === 0) {
+        body = h('div', { className: 'asm-empty' }, '没有已归档的会话');
+      } else {
+        body = h('div', { className: 'asm-list' },
+          items.map(function (s) {
+            return h('label', { key: s.sessionId, className: 'asm-item' },
+              h('input', {
+                type: 'checkbox',
+                checked: !!sel[s.sessionId],
+                onChange: function () { toggleOne(s.sessionId); },
+              }),
+              h('span', { className: 'asm-item-main' },
+                h('span', { className: 'asm-item-title' }, s.title || '（无标题会话）'),
+                h('span', { className: 'asm-item-meta' },
+                  formatTime(s.createdAt) + (s.cwd ? ' · ' + s.cwd : ''))),
+              h('span', { className: 'asm-item-bytes' }, formatBytes(s.sizeBytes)));
+          }));
+      }
+
+      return h('div', { className: 'asm-veil', onClick: close },
+        h('div', { className: 'asm-card asm-card-panel', onClick: function (e) { e.stopPropagation(); } },
+          h('p', { className: 'asm-title' }, '归档会话管理'),
+          h('div', { className: 'asm-toolbar' },
+            h('label', { className: 'asm-item', style: { padding: '4px 0' } },
+              h('input', { type: 'checkbox', checked: !!allSelected, onChange: toggleAll, disabled: !items || items.length === 0 }),
+              h('span', { className: 'asm-toolbar-label' }, '全选（' + selectedIds.length + '/' + (items ? items.length : 0) + '）'))),
+          body,
+          status ? h('p', { className: 'asm-status' + (status.kind === 'err' ? ' asm-status-err' : '') }, status.text) : null,
+          confirming
+            ? h('p', { className: 'asm-desc asm-warn' },
+                '确认永久删除选中的 ' + selectedIds.length + ' 个会话？磁盘记录不可恢复。')
+            : null,
+          h('div', { className: 'asm-footer' },
+            h('span', { className: 'asm-status' },
+              items && items.length > 0
+                ? '共 ' + items.length + ' 个归档会话 · ' + formatBytes(items.reduce(function (a, s) { return a + (s.sizeBytes || 0); }, 0))
+                : ''),
+            h('div', { className: 'asm-row-actions' },
+              h('button', {
+                type: 'button', className: 'asm-btn',
+                disabled: busy || selectedIds.length === 0,
+                onClick: doBatchUnarchive,
+              }, '取消归档'),
+              confirming
+                ? h(React.Fragment, null,
+                    h('button', { type: 'button', className: 'asm-btn', disabled: busy, onClick: function () { setConfirming(false); } }, '再想想'),
+                    h('button', { type: 'button', className: 'asm-btn asm-btn-danger', disabled: busy, onClick: doBatchDelete },
+                      busy ? '删除中…' : '确认删除'))
+                : h('button', {
+                    type: 'button', className: 'asm-btn asm-btn-danger',
+                    disabled: busy || selectedIds.length === 0,
+                    onClick: function () { setConfirming(true); },
+                  }, '批量删除'),
+              h('button', { type: 'button', className: 'asm-btn', onClick: close, disabled: busy }, '关闭')))));
+    }
+
+    // ---- 4) 侧栏底部入口按钮 ----
+    function ManagerEntryButton() {
+      var Icon = Primitives.IconArchiveOutlineRegular || Primitives.IconArchiveOutline;
+      return h('button', {
+        type: 'button',
+        className: 'asm-btn',
+        style: { display: 'inline-flex', alignItems: 'center', gap: '6px' },
+        title: '管理已归档的会话（批量删除 / 批量取消归档）',
+        onClick: function () { setUi({ panelOpen: true }); },
+      }, Icon ? h(Icon, { size: 14 }) : null, '归档管理');
+    }
+
+    // 批量「取消归档」的通路：官方客户端服务 workspaces.unarchiveSession 是
+    // ctx 注入的 Remote 调用，面板组件拿不到该 ctx（槽位渲染只给 ownerProps），
+    // 所以 apply 里把它挂到 window 桥接给面板用。
+    return {
+      inject: ['slots', 'workspaces'],
+      apply(ctx) {
+        // 桥接官方 unarchive Remote（走平台同一通路，含 registry 写入与列表刷新）。
+        window.__dsh_archive_manager_unarchive = function (id) {
+          return ctx.workspaces.unarchiveSession(id);
+        };
+        ctx.effect(function () {
+          return function () { delete window.__dsh_archive_manager_unarchive; };
+        }, 'dsh-archive-session-manager: unarchive bridge');
+
+        // 1) 会话「···」菜单：删除会话（order 500，排在官方 archive(400) 之后）。
+        try {
+          ctx.slots.inject('sidebar.workspaces.session.menu.item', function () {
+            return ctx.slots.register({
+              name: 'sidebar.workspaces.session.menu.item',
+              id: 'dsh-archive-session-manager/delete',
+              order: 500,
+            }, DeleteSessionMenuItem);
+          });
+        } catch (e) { console.warn('[dsh-archive-session-manager] menu item register failed:', e); }
+
+        // 2) 侧栏底部：归档管理入口。
+        try {
+          ctx.slots.inject('sidebar.footer.action', function () {
+            return ctx.slots.register({
+              name: 'sidebar.footer.action',
+              id: 'dsh-archive-session-manager/manage',
+              order: 60,
+            }, ManagerEntryButton);
+          });
+        } catch (e) { console.warn('[dsh-archive-session-manager] footer action register failed:', e); }
+
+        // 3) 全屏浮层：确认对话框 + 批量管理面板。
+        try {
+          ctx.slots.inject('shell.overlay', function* () {
+            yield ctx.slots.register({ name: 'shell.overlay', id: 'dsh-archive-session-manager/confirm' }, ConfirmDeleteDialog);
+            yield ctx.slots.register({ name: 'shell.overlay', id: 'dsh-archive-session-manager/panel' }, ArchiveManagerPanel);
+          });
+        } catch (e) { console.warn('[dsh-archive-session-manager] overlay register failed:', e); }
+      },
+    };
+  },
+});
