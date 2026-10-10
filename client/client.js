@@ -46,8 +46,17 @@ window.__ModuleLoader__.load({
       '.asm-btn:disabled{opacity:.5;cursor:not-allowed}',
       '.asm-btn-danger{background:var(--dsw-alias-state-error-primary);border-color:transparent;color:var(--dsw-alias-bg-base)}',
       '.asm-btn-primary{background:var(--dsw-alias-brand-primary);border-color:transparent;color:var(--dsw-alias-bg-base)}',
-      '.asm-list{max-height:46vh;overflow-y:auto;display:flex;flex-direction:column;gap:2px;margin:0 -6px;padding:0 6px}',
-      '.asm-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;cursor:pointer;border-bottom:.5px solid var(--dsw-alias-border-l1)}',
+      '.asm-list{max-height:52vh;overflow-y:auto;display:flex;flex-direction:column;gap:14px;margin:0 -6px;padding:0 6px}',
+      // 工作区分组
+      '.asm-group{display:flex;flex-direction:column;gap:2px}',
+      '.asm-group-head{display:flex;align-items:center;gap:8px;padding:6px 10px 4px;position:sticky;top:0;',
+      'background:var(--dsw-alias-bg-layer-1);border-bottom:.5px solid var(--dsw-alias-border-l2);z-index:1}',
+      '.asm-group-title-wrap{display:flex;align-items:center;gap:8px;cursor:pointer;min-width:0}',
+      '.asm-group-title{font-size:12.5px;font-weight:600;color:var(--dsw-alias-label-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '.asm-group-count{flex:none;font-size:11px;color:var(--dsw-alias-label-secondary)}',
+      '.asm-group-path{flex:1;min-width:0;font-size:11px;color:var(--dsw-alias-label-secondary);white-space:nowrap;overflow:hidden;',
+      'text-overflow:ellipsis;text-align:right;direction:rtl}',
+      '.asm-item{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:8px;cursor:pointer}',
       '.asm-item:hover{background:var(--dsw-alias-bg-layer-2)}',
       '.asm-item input{flex:none;accent-color:var(--dsw-alias-brand-primary)}',
       '.asm-item-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}',
@@ -206,7 +215,9 @@ window.__ModuleLoader__.load({
     // ownerProps 只有 { close }，数据由本插件自己的宿主路由提供。
     function ArchiveManagerSection() {
       useCss();
+      // items = 扁平会话列表；workspaces = 宿主下发的工作区清单（含 sessionIds 归属）。
       var _items = React.useState(null), items = _items[0], setItems = _items[1];
+      var _wss = React.useState([]), workspaces = _wss[0], setWorkspaces = _wss[1];
       var _sel = React.useState({}), sel = _sel[0], setSel = _sel[1];
       var _status = React.useState(null), status = _status[0], setStatus = _status[1]; // { kind:'info'|'err', text }
       var _busy = React.useState(false), busy = _busy[0], setBusy = _busy[1];
@@ -216,10 +227,11 @@ window.__ModuleLoader__.load({
         setItems(null); setSel({}); setStatus(null); setConfirming(false);
         apiList().then(function (out) {
           setItems(out.sessions || []);
+          setWorkspaces(out.workspaces || []);
           // 宿主拿不到 header 元数据时如实告知，而不是装作没有数据。
           if (out.metaError) setStatus({ kind: 'err', text: '部分会话缺少元数据：' + out.metaError });
         }).catch(function (e) {
-          setItems([]);
+          setItems([]); setWorkspaces([]);
           setStatus({ kind: 'err', text: '列表加载失败：' + String((e && e.message) || e) });
         });
       }
@@ -228,6 +240,32 @@ window.__ModuleLoader__.load({
 
       var selectedIds = Object.keys(sel).filter(function (k) { return sel[k]; });
       var allSelected = !!items && items.length > 0 && selectedIds.length === items.length;
+      // 磁盘上已无对应目录的归档条目（孤儿）：删除时只清理归档记录。
+      var orphans = items ? items.filter(function (s) { return s.orphan; }).length : 0;
+
+      // ---- 按工作区分组 ----
+      // 归属以宿主下发的 workspace.sessionIds 为准（权威记账；归档不改变记账）。
+      // 不在任何工作区记账里的 → 「未分组」（典型是工作区已被删除的遗留归档）。
+      // 组内保持宿主给的顺序（创建时间新→旧），组按「最新会话时间」排序。
+      var groups = React.useMemo(function () {
+        if (!items) return null;
+        var byWs = {};
+        for (var i = 0; i < workspaces.length; i++) byWs[workspaces[i].workspaceId] = { ws: workspaces[i], list: [] };
+        var ungrouped = [];
+        for (var j = 0; j < items.length; j++) {
+          var s = items[j];
+          var bucket = s.workspaceId != null ? byWs[s.workspaceId] : undefined;
+          if (bucket) bucket.list.push(s); else ungrouped.push(s);
+        }
+        var out = [];
+        for (var k = 0; k < workspaces.length; k++) {
+          var g = byWs[workspaces[k].workspaceId];
+          if (g && g.list.length > 0) out.push({ id: g.ws.workspaceId, title: g.ws.title || g.ws.path, path: g.ws.path, list: g.list });
+        }
+        // 未分组始终排在最后。
+        if (ungrouped.length > 0) out.push({ id: '__ungrouped__', title: '未分组', path: '', list: ungrouped });
+        return out;
+      }, [items, workspaces]);
 
       function toggleAll() {
         if (!items) return;
@@ -243,6 +281,15 @@ window.__ModuleLoader__.load({
           return next;
         });
       }
+      // 组级全选/取消：组内全选时点击 → 清空该组；否则 → 全选该组。
+      function toggleGroup(list) {
+        var allOn = list.every(function (s) { return sel[s.sessionId]; });
+        setSel(function (prev) {
+          var next = Object.assign({}, prev);
+          for (var i = 0; i < list.length; i++) next[list[i].sessionId] = !allOn;
+          return next;
+        });
+      }
 
       async function doBatchDelete() {
         setBusy(true); setStatus(null);
@@ -255,9 +302,14 @@ window.__ModuleLoader__.load({
           });
           setItems(function (prev) { return (prev || []).filter(function (s) { return !okIds.has(s.sessionId); }); });
           setSel({}); setConfirming(false);
-          var freed = formatBytes(out.deletedBytes);
+          var freed = out.deletedBytes ? formatBytes(out.deletedBytes) : '';
+          // 孤儿记录没有磁盘内容可删，单独说明，免得用户以为「删了但没释放空间」。
+          var cleaned = out.cleaned || 0;
+          var parts = ['已删除 ' + okIds.size + ' 个会话'];
+          if (freed) parts.push('释放 ' + freed);
+          if (cleaned > 0) parts.push('其中 ' + cleaned + ' 个仅清理了归档记录（磁盘已无文件）');
           setStatus(failures.length === 0
-            ? { kind: 'info', text: '已删除 ' + okIds.size + ' 个会话' + (freed ? '，释放 ' + freed : '') }
+            ? { kind: 'info', text: parts.join('，') }
             : { kind: 'err', text: '已删除 ' + okIds.size + ' 个，失败 ' + failures.length + ' 个：' + failures[0] });
         } catch (e) {
           setStatus({ kind: 'err', text: '批量删除失败：' + String(e && e.message || e) });
@@ -284,6 +336,22 @@ window.__ModuleLoader__.load({
         setBusy(false);
       }
 
+      // 单行会话（组内复用）
+      function sessionRow(s) {
+        return h('label', { key: s.sessionId, className: 'asm-item' },
+          h('input', {
+            type: 'checkbox',
+            checked: !!sel[s.sessionId],
+            onChange: function () { toggleOne(s.sessionId); },
+          }),
+          h('span', { className: 'asm-item-main' },
+            h('span', { className: 'asm-item-title' }, s.title || '（无标题会话）'),
+            h('span', { className: 'asm-item-meta' },
+              formatTime(s.createdAt)
+              + (s.orphan ? ' · 磁盘上已不存在（仅清理归档记录）' : ''))),
+          h('span', { className: 'asm-item-bytes' }, s.orphan ? '—' : formatBytes(s.sizeBytes)));
+      }
+
       var body;
       if (items === null) {
         body = h('div', { className: 'asm-empty' }, '加载中…');
@@ -291,18 +359,23 @@ window.__ModuleLoader__.load({
         body = h('div', { className: 'asm-empty' }, '没有已归档的会话');
       } else {
         body = h('div', { className: 'asm-list' },
-          items.map(function (s) {
-            return h('label', { key: s.sessionId, className: 'asm-item' },
-              h('input', {
-                type: 'checkbox',
-                checked: !!sel[s.sessionId],
-                onChange: function () { toggleOne(s.sessionId); },
-              }),
-              h('span', { className: 'asm-item-main' },
-                h('span', { className: 'asm-item-title' }, s.title || '（无标题会话）'),
-                h('span', { className: 'asm-item-meta' },
-                  formatTime(s.createdAt) + (s.cwd ? ' · ' + s.cwd : ''))),
-              h('span', { className: 'asm-item-bytes' }, formatBytes(s.sizeBytes)));
+          (groups || []).map(function (g) {
+            var groupBytes = g.list.reduce(function (a, s) { return a + (s.sizeBytes || 0); }, 0);
+            var groupSel = g.list.filter(function (s) { return sel[s.sessionId]; }).length;
+            return h('div', { key: g.id, className: 'asm-group' },
+              h('div', { className: 'asm-group-head' },
+                h('label', { className: 'asm-group-title-wrap' },
+                  h('input', {
+                    type: 'checkbox',
+                    // 组全选：非全选状态按下即全选该组（不处理半选的三态）。
+                    checked: groupSel === g.list.length,
+                    onChange: function () { toggleGroup(g.list); },
+                  }),
+                  h('span', { className: 'asm-group-title' }, g.title || '未命名工作区'),
+                  h('span', { className: 'asm-group-count' }, groupSel + '/' + g.list.length)),
+                h('span', { className: 'asm-group-path' }, g.path || ''),
+                h('span', { className: 'asm-item-bytes' }, formatBytes(groupBytes))),
+              g.list.map(sessionRow));
           }));
       }
 
@@ -324,7 +397,8 @@ window.__ModuleLoader__.load({
         h('div', { className: 'asm-footer' },
           h('span', { className: 'asm-status' },
             items && items.length > 0
-              ? '共 ' + items.length + ' 个归档会话 · ' + formatBytes(items.reduce(function (a, s) { return a + (s.sizeBytes || 0); }, 0))
+              ? ('共 ' + items.length + ' 个归档会话 · ' + formatBytes(items.reduce(function (a, s) { return a + (s.sizeBytes || 0); }, 0))
+                 + (orphans > 0 ? ' · ' + orphans + ' 个磁盘已不存在' : ''))
               : ''),
           h('div', { className: 'asm-row-actions' },
             h('button', {
