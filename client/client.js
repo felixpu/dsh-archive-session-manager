@@ -143,6 +143,12 @@ window.__ModuleLoader__.load({
       var Icon = Primitives.IconTrashOutlineRegular;
       return h(Primitives.MenuItemButton, {
         icon: Icon ? h(Icon, { size: 14 }) : undefined,
+        // danger=true 是 ui-primitives MenuItemButton 的原生属性（读源码确认，
+        // 渲染 css.item + css.danger），即平台统一的红色危险项样式。
+        // 不要自造颜色 —— 官方主题/明暗切换下才能与其它危险操作保持一致。
+        danger: true,
+        // 在「取消归档」等常规行下方加分隔线，降低误点概率。
+        separatorBefore: true,
         onSelect: function () {
           setMenuOpen(false);
           setUi({ confirm: { sessionId: sessionId, displayTitle: displayTitle || sessionId } });
