@@ -57,6 +57,8 @@ window.__ModuleLoader__.load({
       '.asm-group-path{flex:1;min-width:0;font-size:11px;color:var(--dsw-alias-label-secondary);white-space:nowrap;overflow:hidden;',
       'text-overflow:ellipsis;text-align:right;direction:rtl}',
       '.asm-item{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:8px;cursor:pointer}',
+      '.asm-item-disabled{cursor:not-allowed;opacity:.55}',
+      '.asm-item-disabled:hover{background:transparent}',
       '.asm-item:hover{background:var(--dsw-alias-bg-layer-2)}',
       '.asm-item input{flex:none;accent-color:var(--dsw-alias-brand-primary)}',
       '.asm-item-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}',
@@ -376,11 +378,20 @@ window.__ModuleLoader__.load({
       }
 
       // 单行会话（组内复用）
+      // 只有**正在执行任务**（running）的会话禁止勾选：宿主会拒绝（session-running）。
+      // 注意区分 live 与 running：被打开过的会话会常驻为 live agent 但通常处于
+      // idle（没在跑任务），那种情况是可以安全删除的（实测反馈：live 一概拒绝
+      // 会让「我明明没在用它却删不掉」）。
       function sessionRow(s) {
-        return h('label', { key: s.sessionId, className: 'asm-item' },
+        return h('label', {
+          key: s.sessionId,
+          className: 'asm-item' + (s.running ? ' asm-item-disabled' : ''),
+          title: s.running ? '该会话正在执行任务，无法删除；请先停止它' : '',
+        },
           h('input', {
             type: 'checkbox',
             checked: !!sel[s.sessionId],
+            disabled: !!s.running,
             onChange: function () { toggleOne(s.sessionId); },
           }),
           h('span', { className: 'asm-item-main' },
