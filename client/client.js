@@ -66,6 +66,10 @@ window.__ModuleLoader__.load({
       '.asm-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px}',
       '.asm-toolbar-label{font-size:12px;color:var(--dsw-alias-label-secondary)}',
       '.asm-empty{padding:32px 0;text-align:center;font-size:13px;color:var(--dsw-alias-label-secondary)}',
+      // 提示条（幽灵记账清理）
+      '.asm-notice{display:flex;align-items:center;gap:12px;justify-content:space-between;padding:10px 12px;border-radius:10px;',
+      'border:.5px solid var(--dsw-alias-state-warn-primary);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 10%,transparent);',
+      'font-size:12px;line-height:1.55;color:var(--dsw-alias-label-primary)}',
       '.asm-footer{display:flex;align-items:center;justify-content:space-between;gap:8px;border-top:.5px solid var(--dsw-alias-border-l1);padding-top:12px}',
       '.asm-status{font-size:12px;color:var(--dsw-alias-label-secondary)}',
       '.asm-status-err{color:var(--dsw-alias-state-error-primary)}',
@@ -104,6 +108,17 @@ window.__ModuleLoader__.load({
     async function apiList() {
       var res = await fetch(API + '/list', { credentials: 'same-origin' });
       if (!res.ok) throw new Error('list http ' + res.status);
+      return res.json();
+    }
+    /** 清理幽灵记账（不删磁盘内容——那些文件早已不存在）。 */
+    async function apiCleanupGhosts() {
+      var res = await fetch(API + '/cleanup-ghosts', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (!res.ok) throw new Error('cleanup http ' + res.status);
       return res.json();
     }
     async function apiDelete(sessionIds) {
@@ -222,12 +237,15 @@ window.__ModuleLoader__.load({
       var _status = React.useState(null), status = _status[0], setStatus = _status[1]; // { kind:'info'|'err', text }
       var _busy = React.useState(false), busy = _busy[0], setBusy = _busy[1];
       var _confirming = React.useState(false), confirming = _confirming[0], setConfirming = _confirming[1];
+      // 幽灵记账：工作区里记着、磁盘上已无的会话（历史手工删除的遗留）。
+      var _ghosts = React.useState(null), ghosts = _ghosts[0], setGhosts = _ghosts[1];
 
       function load() {
-        setItems(null); setSel({}); setStatus(null); setConfirming(false);
+        setItems(null); setSel({}); setStatus(null); setConfirming(false); setGhosts(null);
         apiList().then(function (out) {
           setItems(out.sessions || []);
           setWorkspaces(out.workspaces || []);
+          setGhosts(out.ghosts || []);
           // 宿主拿不到数据时如实告知，而不是静默显示成「没有数据」——
           // 之前正是静默吞异常让「工作区为空 → 全部未分组」极难定位。
           var errs = [];
@@ -235,7 +253,7 @@ window.__ModuleLoader__.load({
           if (out.workspaceError) errs.push('工作区列表：' + out.workspaceError);
           if (errs.length > 0) setStatus({ kind: 'err', text: '部分数据获取失败 → ' + errs.join('；') });
         }).catch(function (e) {
-          setItems([]); setWorkspaces([]);
+          setItems([]); setWorkspaces([]); setGhosts(null);
           setStatus({ kind: 'err', text: '列表加载失败：' + String((e && e.message) || e) });
         });
       }
@@ -343,6 +361,20 @@ window.__ModuleLoader__.load({
         setBusy(false);
       }
 
+      async function doCleanupGhosts() {
+        setBusy(true); setStatus(null);
+        try {
+          var out = await apiCleanupGhosts();
+          setStatus({ kind: 'info', text: '已清理 ' + (out.removed || 0) + ' 个失效的列表记账' });
+          // 重新拉取，让界面与平台状态一致。
+          load();
+        } catch (e) {
+          setStatus({ kind: 'err', text: '清理失败：' + String((e && e.message) || e) });
+        } finally {
+          setBusy(false);
+        }
+      }
+
       // 单行会话（组内复用）
       function sessionRow(s) {
         return h('label', { key: s.sessionId, className: 'asm-item' },
@@ -390,6 +422,17 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'asm-section' },
         h('p', { className: 'asm-desc' },
           '这里列出全部已归档会话。可多选后批量删除（永久删除磁盘记录）或批量取消归档。'),
+        // 幽灵记账提示：磁盘已无、但工作区仍记着的会话，会以空会话形式出现在
+        // 侧栏列表里且无法点开，用户无法自行清除 —— 因此在这里提供一键清理。
+        (ghosts && ghosts.length > 0)
+          ? h('div', { className: 'asm-notice' },
+              h('span', null,
+                '检测到 ' + ghosts.reduce(function (a, g) { return a + g.sessionIds.length; }, 0)
+                + ' 个失效的列表记账（会话文件已不在磁盘上，多为历史手工删除遗留），'
+                + '它们会在侧栏显示为空会话。'),
+              h('button', { type: 'button', className: 'asm-btn', onClick: doCleanupGhosts, disabled: busy },
+                busy ? '清理中…' : '清理'))
+          : null,
         h('div', { className: 'asm-toolbar' },
           h('label', { className: 'asm-item', style: { padding: '4px 0' } },
             h('input', { type: 'checkbox', checked: !!allSelected, onChange: toggleAll, disabled: !items || items.length === 0 }),
