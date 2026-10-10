@@ -228,8 +228,12 @@ window.__ModuleLoader__.load({
         apiList().then(function (out) {
           setItems(out.sessions || []);
           setWorkspaces(out.workspaces || []);
-          // 宿主拿不到 header 元数据时如实告知，而不是装作没有数据。
-          if (out.metaError) setStatus({ kind: 'err', text: '部分会话缺少元数据：' + out.metaError });
+          // 宿主拿不到数据时如实告知，而不是静默显示成「没有数据」——
+          // 之前正是静默吞异常让「工作区为空 → 全部未分组」极难定位。
+          var errs = [];
+          if (out.metaError) errs.push('会话元数据：' + out.metaError);
+          if (out.workspaceError) errs.push('工作区列表：' + out.workspaceError);
+          if (errs.length > 0) setStatus({ kind: 'err', text: '部分数据获取失败 → ' + errs.join('；') });
         }).catch(function (e) {
           setItems([]); setWorkspaces([]);
           setStatus({ kind: 'err', text: '列表加载失败：' + String((e && e.message) || e) });
@@ -297,8 +301,10 @@ window.__ModuleLoader__.load({
           var out = await apiDelete(selectedIds);
           var okIds = new Set();
           var failures = [];
+          var warned = 0;
           (out.results || []).forEach(function (r) {
-            if (r.ok) okIds.add(r.sessionId); else failures.push(r.error);
+            if (r.ok) { okIds.add(r.sessionId); if (r.warnings && r.warnings.length) warned++; }
+            else failures.push(r.error);
           });
           setItems(function (prev) { return (prev || []).filter(function (s) { return !okIds.has(s.sessionId); }); });
           setSel({}); setConfirming(false);
@@ -308,6 +314,7 @@ window.__ModuleLoader__.load({
           var parts = ['已删除 ' + okIds.size + ' 个会话'];
           if (freed) parts.push('释放 ' + freed);
           if (cleaned > 0) parts.push('其中 ' + cleaned + ' 个仅清理了归档记录（磁盘已无文件）');
+          if (warned > 0) parts.push(warned + ' 个的列表记账未能立即清理，重启 DSH 后自动收敛');
           setStatus(failures.length === 0
             ? { kind: 'info', text: parts.join('，') }
             : { kind: 'err', text: '已删除 ' + okIds.size + ' 个，失败 ' + failures.length + ' 个：' + failures[0] });
