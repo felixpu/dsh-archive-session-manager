@@ -148,7 +148,7 @@ const sessionIds = changed.sessionIds.filter((id) => this.host.sessionPath(id) =
 
 | 半身 | 文件 | 职责 |
 |---|---|---|
-| 宿主 | `lib/index.js` | 六条同源路由 + 启动期清理：`GET .../list`（列出归档会话 + 工作区 + 幽灵记账 + **pendingRestart**）、`POST .../delete`（校验 → **`evictLiveSession` 驱逐 live 会话** → 删目录 → 清记账与归档 → 发 `api-session/removed`）、`POST .../cleanup-ghosts`、`POST .../repair`（`attachSession` 归位，**跳过子智能体**，支持 `dryRun`）、`POST .../detach-subagents`（只改记账）、`POST .../empty-sessions`（列出/删除**从未有过对话**的空会话；服务端二次校验、拒删有内容的）；另有 `pruneDeadArchived()` 在启动后首次列表时清掉任何地方都不存在的归档 id |
+| 宿主 | `lib/index.js` | 七条同源路由 + 启动期清理：`GET .../list`（列出归档会话 + 工作区 + 幽灵记账 + **pendingRestart**）、`POST .../delete`（校验 → **`evictLiveSession` 驱逐 live 会话** → 删目录 → 清记账与归档 → 发 `api-session/removed`）、`POST .../evict`（重试驱逐：只驱逐 + 清记账，**不动磁盘**，供「已删除但仍被内存持有」时手动重试）、`POST .../cleanup-ghosts`、`POST .../repair`（`attachSession` 归位，**跳过子智能体**，支持 `dryRun`）、`POST .../detach-subagents`（只改记账）、`POST .../empty-sessions`（列出/删除**从未有过对话**的空会话；服务端二次校验、拒删有内容的）；另有 `pruneDeadArchived()` 在启动后首次列表时清掉任何地方都不存在的归档 id |
 | 客户端 | `client/client.js` | ① `sidebar.workspaces.session.menu.item` 注册「删除会话」（order 500，danger 样式，仅归档行可见）② `settings.section` 注册「归档会话」设置页（order 65，按工作区分组的批量管理正文，另含「归位失效会话」「一键摘除误记账的子智能体」「清理遗留空会话」入口，以及 `pendingRestart` 状态提示）③ `shell.overlay` 注册单个删除的确认对话框 |
 
 ## 已知坑（开发时实测）
