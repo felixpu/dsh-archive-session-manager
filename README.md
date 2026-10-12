@@ -115,6 +115,27 @@ The UI is available in **Chinese and English**, following the platform language
 setting under **Settings → General → Language**. Switching applies immediately —
 no reload or reinstall needed.
 
+## 展示元数据（locale）
+
+`locale/en.json` 与 `locale/zh.json` 提供**插件展示元数据**（`meta.title` / `meta.description`）——
+即插件列表里显示的名称与说明。Plugin Manager 与设置页**无需激活插件**即可读取，
+因此安装后、甚至未启动时就能显示本地化名称。
+
+```json
+{ "meta": { "title": "…", "description": "…" } }
+```
+
+它与上面的界面文案是**两套东西**：界面文案走客户端 `ctx.locale.register`（运行时，随语言切换立即变），
+展示元数据走这两个静态 JSON（宿主读 manifest，不回退到界面字典）。
+
+⚠️ 两个容易漏的点（漏任一个都会**静默失效**，宿主不报错）：
+
+1. **必须在 `package.json` 的 `exports` 里导出 `./locale/*.json`** —— 宿主经 Node 模块解析器
+   读取该资源，未导出的子路径会得到 `ERR_PACKAGE_PATH_NOT_EXPORTED`，被当作「没有 locale」跳过。
+2. **`files` 需包含 `locale`** —— 否则 `pnpm pack` / `npm publish` 的产物里不会带上它。
+
+`icon.svg` 走顶层 `icon` 字段（相对路径），**不需要** `exports`。
+
 ## 常见问题
 
 **删除了，但列表里还有它？**
