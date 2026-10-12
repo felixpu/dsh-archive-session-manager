@@ -160,6 +160,20 @@ window.__ModuleLoader__.load({
       if (!res.ok) throw new Error('empty-sessions http ' + res.status);
       return res.json();
     }
+    /**
+     * 重试驱逐：对「已删除但内存态仍被持有」的会话再走一次驱逐。
+     * 复用 /evict 路由（宿主侧只做驱逐 + 清理标记，不碰磁盘——磁盘早已删除）。
+     */
+    async function apiEvict(sessionIds) {
+      var res = await fetch(API + '/evict', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionIds: sessionIds }),
+      });
+      if (!res.ok) throw new Error('evict http ' + res.status);
+      return res.json();
+    }
     async function apiDelete(sessionIds) {
       var res = await fetch(API + '/delete', {
         method: 'POST',
@@ -560,6 +574,30 @@ window.__ModuleLoader__.load({
       }
 
       /**
+       * 对「已删除但仍待重启清标记」的条目重试驱逐。
+       * 宿主侧只做驱逐与记账清理（磁盘记录早已删除），成功则该条目从本清单消失。
+       */
+      async function doEvictPending() {
+        if (!pendingRestart || pendingRestart.length === 0) return;
+        setBusy(true); setStatus(null);
+        try {
+          var ids = pendingRestart.map(function (x) { return x.sessionId; });
+          var out = await apiEvict(ids);
+          var evicted = (out && out.evicted) || 0;
+          var fails = ((out && out.results) || []).filter(function (r) { return r && r.ok === false; });
+          setStatus(fails.length === 0
+            ? { kind: 'info', text: evicted > 0 ? '已驱逐 ' + evicted + ' 个会话的内存态' : '这些会话已不在内存中' }
+            : { kind: 'err', text: '驱逐 ' + evicted + ' 个，失败 ' + fails.length + ' 个：' + (fails[0].error || '') });
+          // 刷新清单（成功的条目会从 pendingRestart 里消失）。
+          refreshPendingRestart();
+        } catch (e) {
+          setStatus({ kind: 'err', text: '驱逐失败：' + String((e && e.message) || e) });
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      /**
        * 执行「摘除误记账的子智能体」。只改记账归属，**不删任何磁盘文件**
        * （子智能体的会话文件本就该留在磁盘上，只是不该占用用户工作区的归属槽位）。
        */
@@ -735,17 +773,20 @@ window.__ModuleLoader__.load({
                   repairing ? '归位中…' : '一键归位')))
           : null,
         // 「已删除，等待重启回收」的条目。
-        // ⚠️ 这一条必须与「归档会话列表」严格分开：平台**没有删除会话的 API**，
-        //    对仍 live 的会话我们只能保留归档标记来让侧栏隐藏它（否则它会掉进
-        //    「未分组」）。代价是该标记要等重启才能清掉。若把它当普通归档会话列在
-        //    上面，用户点「删除」→ 那一行原地不动 → 观感就是「删了又回来」（实测）。
+        // ⚠️ 这一条必须与「归档会话列表」严格分开：若把它当普通归档会话列在上面，
+        //    用户点「删除」→ 那一行原地不动 → 观感就是「删了又回来」（实测）。
+        //    宿主侧会尝试驱逐内存态（evictLiveSession）；驱逐成功的条目根本不会
+        //    出现在这里。剩下的说明平台当时拒绝驱逐，给出「重试」入口。
         (pendingRestart && pendingRestart.length > 0)
           ? h('div', { className: 'asm-notice' },
               h('span', { className: 'asm-notice-main' },
                 '有 ' + pendingRestart.length + ' 个会话已删除：磁盘记录已移除，它们也不会出现在侧栏。',
                 h('span', { className: 'asm-notice-detail' },
-                  '平台的会话对象在本进程内仍被持有（平台未提供删除会话的 API），'
-                  + '所以这个归档标记要等「重启 DSH」后才能清掉。这不是未完成的操作，无需重复删除。')))
+                  '它们在本进程内仍被平台内存持有。插件已尝试驱逐；若平台当时拒绝，'
+                  + '该归档标记会留到重启 DSH 才清掉 —— 可点右侧重试一次。')),
+              h('span', { className: 'asm-notice-actions' },
+                h('button', { type: 'button', className: 'asm-btn', disabled: busy,
+                  onClick: doEvictPending }, busy ? '处理中…' : '重试驱逐')))
           : null,
         // 磁盘遗留空会话：建了却从未用过（无任何 user/message）。
         // ⚠️ 这是唯一会**真正删除磁盘文件**的维护项 —— 语气必须与上面几个
