@@ -112,21 +112,42 @@ window.__ModuleLoader__.load({
       return sub;
     }
 
-    async function apiList() {
-      var res = await fetch(API + '/list', { credentials: 'same-origin' });
-      if (!res.ok) throw new Error('list http ' + res.status);
+    /**
+     * 宿主路由的统一调用：GET 取 JSON。
+     * @param path 路由路径（不含 API 前缀），如 '/list'
+     * @param label 出错时的短标识，用于拼 "list http 500"
+     */
+    async function apiGet(path, label) {
+      var res = await fetch(API + path, { credentials: 'same-origin' });
+      if (!res.ok) throw new Error(label + ' http ' + res.status);
       return res.json();
     }
-    /** 清理幽灵记账（不删磁盘内容——那些文件早已不存在）。 */
-    async function apiCleanupGhosts() {
-      var res = await fetch(API + '/cleanup-ghosts', {
+
+    /**
+     * 宿主路由的统一调用：POST JSON 并取 JSON。
+     *
+     * 原先 6 个 POST 包装函数各自重复 `method/credentials/headers` 三行加
+     * 「!res.ok 抛错 + return res.json()」两行，共 ~70 行只差端点、body、label 三处。
+     * 收敛到这里后新增路由只需一行，也避免将来只改一处（例如加重试、超时、
+     * 统一错误体解析）造成行为不一致。
+     */
+    async function apiPost(path, body, label) {
+      var res = await fetch(API + path, {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({}),
+        body: JSON.stringify(body || {}),
       });
-      if (!res.ok) throw new Error('cleanup http ' + res.status);
+      if (!res.ok) throw new Error(label + ' http ' + res.status);
       return res.json();
+    }
+
+    async function apiList() {
+      return apiGet('/list', 'list');
+    }
+    /** 清理幽灵记账（不删磁盘内容——那些文件早已不存在）。 */
+    async function apiCleanupGhosts() {
+      return apiPost('/cleanup-ghosts', {}, 'cleanup');
     }
     /**
      * 清理「被误记账的子智能体」：把子智能体从工作区归属记账里摘掉。
@@ -135,14 +156,7 @@ window.__ModuleLoader__.load({
      * 只改记账、不动磁盘文件；dryRun=true 为只读预览。
      */
     async function apiDetachSubagents(dryRun) {
-      var res = await fetch(API + '/detach-subagents', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(dryRun ? { dryRun: true } : {}),
-      });
-      if (!res.ok) throw new Error('detach-subagents http ' + res.status);
-      return res.json();
+      return apiPost('/detach-subagents', dryRun ? { dryRun: true } : {}, 'detach-subagents');
     }
     /**
      * 磁盘遗留空会话：建了却从未用过（无任何 user/message）的会话目录。
@@ -151,38 +165,17 @@ window.__ModuleLoader__.load({
      */
     async function apiEmptySessions(dryRun, sessionIds) {
       var body = dryRun ? { dryRun: true } : (sessionIds ? { sessionIds: sessionIds } : {});
-      var res = await fetch(API + '/empty-sessions', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) throw new Error('empty-sessions http ' + res.status);
-      return res.json();
+      return apiPost('/empty-sessions', body, 'empty-sessions');
     }
     /**
-     * 重试驱逐：对「已删除但内存态仍被持有」的会话再走一次驱逐。
+     * 重试驱逐：对「已删除但当时驱逐失败」的会话再走一次驱逐。
      * 复用 /evict 路由（宿主侧只做驱逐 + 清理标记，不碰磁盘——磁盘早已删除）。
      */
     async function apiEvict(sessionIds) {
-      var res = await fetch(API + '/evict', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionIds: sessionIds }),
-      });
-      if (!res.ok) throw new Error('evict http ' + res.status);
-      return res.json();
+      return apiPost('/evict', { sessionIds: sessionIds }, 'evict');
     }
     async function apiDelete(sessionIds) {
-      var res = await fetch(API + '/delete', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionIds: sessionIds }),
-      });
-      if (!res.ok) throw new Error('delete http ' + res.status);
-      return res.json();
+      return apiPost('/delete', { sessionIds: sessionIds }, 'delete');
     }
     /**
      * 归位：把「磁盘上有、但不在任何工作区记账里」的会话挂回它 cwd 对应的工作区。
@@ -190,14 +183,7 @@ window.__ModuleLoader__.load({
      * dryRun=true 是**只读预览**，宿主不写任何状态（按钮上也要向用户说清这一点）。
      */
     async function apiRepair(dryRun) {
-      var res = await fetch(API + '/repair', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(dryRun ? { dryRun: true } : {}),
-      });
-      if (!res.ok) throw new Error('repair http ' + res.status);
-      return res.json();
+      return apiPost('/repair', dryRun ? { dryRun: true } : {}, 'repair');
     }
 
     function formatBytes(n) {
@@ -328,9 +314,10 @@ window.__ModuleLoader__.load({
       var _emptiesErr = React.useState(''), emptiesError = _emptiesErr[0], setEmptiesError = _emptiesErr[1];
       var _emptiesBusy = React.useState(false), emptiesBusy = _emptiesBusy[0], setEmptiesBusy = _emptiesBusy[1];
       var _emptiesConfirm = React.useState(false), emptiesConfirm = _emptiesConfirm[0], setEmptiesConfirm = _emptiesConfirm[1];
-      // 本次进程内已删除、但内存态仍被平台持有（磁盘已无）的会话。
-      // 它们**不是**归档会话，只等重启回收 —— 单列出来，绝不允许混进归档列表
+      // 删除已执行、但当时驱逐失败的会话（磁盘已无、内存态仍在）。
+      // 它们**不是**归档会话 —— 单列出来，绝不允许混进归档列表
       // （混进去会让用户点删除后那一行原地不动，观感就是「删了又回来」）。
+      // 正常删除会在宿主侧当场驱逐成功，根本不进这里；这里是罕见兜底，可「重试驱逐」。
       var _pendingRestart = React.useState([]), pendingRestart = _pendingRestart[0], setPendingRestart = _pendingRestart[1];
 
       /**
@@ -385,7 +372,7 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * 只刷新「已删除待重启」清单，不碰面板其余状态。
+       * 只刷新「待驱逐」清单，不碰面板其余状态。
        *
        * 为什么需要单独一个：删除完成后若不刷新它，那条提示要等用户手动点「刷新」
        * 或重开面板才出现 —— 用户刚删完看到的仍是"什么也没发生"，正是本轮要消除的观感。
@@ -397,8 +384,17 @@ window.__ModuleLoader__.load({
         }).catch(function () { /* 失败就保持原样，不打扰用户 */ });
       }
 
-      function load() {
-        setItems(null); setSel({}); setStatus(null); setConfirming(false); setGhosts(null); setPendingRestart([]);
+      /**
+       * 重拉面板数据。
+       *
+       * ⚠️ 默认会 `setStatus(null)`（清掉上一次的提示）。React 18 自动批处理下，
+       * 若调用方先写成功文案、再在同一同步块里调 `load()`，那条文案会被这里的
+       * `setStatus(null)` **覆盖掉**（同一 state 只保留最后一次写入）→ 用户看不到结果。
+       * 需要保留提示的调用方必须传 `{ keepStatus: true }`，或改用 refreshPendingRestart()。
+       */
+      function load(opts) {
+        const keepStatus = !!(opts && opts.keepStatus);
+        setItems(null); setSel({}); if (!keepStatus) setStatus(null); setConfirming(false); setGhosts(null); setPendingRestart([]);
         apiList().then(function (out) {
           setItems(out.sessions || []);
           setWorkspaces(out.workspaces || []);
@@ -518,20 +514,20 @@ window.__ModuleLoader__.load({
           var parts = ['已删除 ' + okIds.size + ' 个会话'];
           if (freed) parts.push('释放 ' + freed);
           if (cleaned > 0) parts.push('其中 ' + cleaned + ' 个仅清理了归档记录（磁盘已无文件）');
-          // 关于 live 会话的如实告知（2026-10-12 修正）。
+          // 关于 live 会话的如实告知（2026-10-12 二修）。
           // 平台会把「本进程内存中仍存活的会话」并入列表（sessionQuery.listSessions
-          // 用 ctx.sessions.list() 覆盖合并），所以磁盘文件删掉后，只要它还 live，
-          // 刷新页面仍会被列出来。宿主侧现在对这类会话**保留归档标记且不摘记账**，
-          // 于是它被归档过滤器隐藏、且不会掉进「未分组」——侧栏观感是干净的。
-          // 但「删除」对它而言要到重启 DSH 后才彻底生效，必须如实说清。
-          if (liveCount > 0) parts.push('其中 ' + liveCount + ' 个会话在本进程内仍被平台持有：磁盘记录已删除、它们不会出现在侧栏（已保持在归档隐藏状态），重启 DSH 后彻底消失');
-          if (warned > 0) parts.push(warned + ' 个的列表记账未能立即清理，重启 DSH 后自动收敛');
+          // 用 ctx.sessions.list() 覆盖合并），所以只删磁盘文件、不驱逐内存态，
+          // 刷新页面它仍会被列出来。宿主侧现在会**先驱逐内存态**
+          // （evictLiveSession → session/disposed），正常情况当场就干净了。
+          // 若某次驱逐失败，该条目会进 pendingRestart，可用面板的「重试驱逐」清掉。
+          if (liveCount > 0) parts.push('其中 ' + liveCount + ' 个会话已连同内存态一并驱逐');
+          if (warned > 0) parts.push(warned + ' 个的列表记账未能立即清理，可在面板点「重试驱逐」或重启后自动收敛');
           setStatus(failures.length === 0
-            // live 不再是「错误」：宿主的处理已保证它不会污染侧栏，只是延迟到重启
-            // 才彻底消失。用 info 呈现（此前用 err 红字，会让用户以为删失败了）。
+            // live 不再是「错误」：宿主的驱逐已保证它不会污染侧栏。
+            // 用 info 呈现（此前用 err 红字，会让用户以为删失败了）。
             ? { kind: 'info', text: parts.join('，') }
             : { kind: 'err', text: '已删除 ' + okIds.size + ' 个，失败 ' + failures.length + ' 个：' + failures[0] });
-          // 有 live 会话被删时，同步刷新「已删除待重启」清单，让那条如实的状态提示
+          // 有 live 会话被删时，同步刷新「待驱逐」清单，让那条如实的状态提示
           // 当场出现（而不是等用户手动刷新，误以为删了没反应）。
           if (liveCount > 0) refreshPendingRestart();
         } catch (e) {
@@ -565,7 +561,8 @@ window.__ModuleLoader__.load({
           var out = await apiCleanupGhosts();
           setStatus({ kind: 'info', text: '已清理 ' + (out.removed || 0) + ' 个失效的列表记账' });
           // 重新拉取，让界面与平台状态一致。
-          load();
+          // ⚠️ 必须 keepStatus：否则上面的成功文案会被 load() 开头的 setStatus(null) 清掉。
+          load({ keepStatus: true });
         } catch (e) {
           setStatus({ kind: 'err', text: '清理失败：' + String((e && e.message) || e) });
         } finally {
@@ -574,7 +571,7 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * 对「已删除但仍待重启清标记」的条目重试驱逐。
+       * 对「已删除但当时驱逐失败」的条目重试驱逐。
        * 宿主侧只做驱逐与记账清理（磁盘记录早已删除），成功则该条目从本清单消失。
        */
       async function doEvictPending() {
@@ -611,8 +608,8 @@ window.__ModuleLoader__.load({
           setStatus(fails.length === 0
             ? { kind: 'info', text: '已从工作区记账中摘除 ' + removed + ' 个子智能体（会话文件未动）' }
             : { kind: 'err', text: '已摘除 ' + removed + ' 个，失败 ' + fails.length + ' 个：' + (fails[0].error || '未知错误') });
-          // 记账变了 → 重拉面板与预览。
-          load();
+          // 记账变了 → 重拉面板与预览。⚠️ keepStatus：保住上面的结果文案。
+          load({ keepStatus: true });
           previewSubagents();
         } catch (e) {
           setStatus({ kind: 'err', text: '摘除失败：' + String((e && e.message) || e) });
@@ -640,7 +637,8 @@ window.__ModuleLoader__.load({
             ? { kind: 'info', text: parts.join('，') }
             : { kind: 'err', text: parts.join('，') });
           setEmptiesConfirm(false);
-          load(); previewEmpties();
+          // ⚠️ keepStatus：保住上面的删除结果文案（同 doCleanupGhosts 的理由）。
+          load({ keepStatus: true }); previewEmpties();
         } catch (e) {
           setStatus({ kind: 'err', text: '删除空会话失败：' + String((e && e.message) || e) });
         } finally {
@@ -772,7 +770,7 @@ window.__ModuleLoader__.load({
                 h('button', { type: 'button', className: 'asm-btn asm-btn-primary', onClick: doRepair, disabled: repairing },
                   repairing ? '归位中…' : '一键归位')))
           : null,
-        // 「已删除，等待重启回收」的条目。
+        // 删除已执行、但当时驱逐失败的条目（罕见兜底）。
         // ⚠️ 这一条必须与「归档会话列表」严格分开：若把它当普通归档会话列在上面，
         //    用户点「删除」→ 那一行原地不动 → 观感就是「删了又回来」（实测）。
         //    宿主侧会尝试驱逐内存态（evictLiveSession）；驱逐成功的条目根本不会
