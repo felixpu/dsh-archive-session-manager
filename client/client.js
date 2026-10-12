@@ -314,6 +314,10 @@ window.__ModuleLoader__.load({
       var _emptiesErr = React.useState(''), emptiesError = _emptiesErr[0], setEmptiesError = _emptiesErr[1];
       var _emptiesBusy = React.useState(false), emptiesBusy = _emptiesBusy[0], setEmptiesBusy = _emptiesBusy[1];
       var _emptiesConfirm = React.useState(false), emptiesConfirm = _emptiesConfirm[0], setEmptiesConfirm = _emptiesConfirm[1];
+      // 本次进程内已删除、但内存态仍被平台持有（磁盘已无）的会话。
+      // 它们**不是**归档会话，只等重启回收 —— 单列出来，绝不允许混进归档列表
+      // （混进去会让用户点删除后那一行原地不动，观感就是「删了又回来」）。
+      var _pendingRestart = React.useState([]), pendingRestart = _pendingRestart[0], setPendingRestart = _pendingRestart[1];
 
       /**
        * 拉归位预览（只读）。任何异常都咽进 repairError，不抛给调用方。
@@ -367,11 +371,12 @@ window.__ModuleLoader__.load({
       }
 
       function load() {
-        setItems(null); setSel({}); setStatus(null); setConfirming(false); setGhosts(null);
+        setItems(null); setSel({}); setStatus(null); setConfirming(false); setGhosts(null); setPendingRestart([]);
         apiList().then(function (out) {
           setItems(out.sessions || []);
           setWorkspaces(out.workspaces || []);
           setGhosts(out.ghosts || []);
+          setPendingRestart(((out && out.pendingRestart) || []).filter(function (x) { return !!x; }));
           // 宿主拿不到数据时如实告知，而不是静默显示成「没有数据」——
           // 之前正是静默吞异常让「工作区为空 → 全部未分组」极难定位。
           var errs = [];
@@ -647,13 +652,11 @@ window.__ModuleLoader__.load({
             h('span', { className: 'asm-item-title' }, s.title || '（无标题会话）'),
             h('span', { className: 'asm-item-meta' },
               formatTime(s.createdAt)
-              // 磁盘已删的条目要说清它的**真实状态**，否则用户看到「0 B」的普通行
-              // 会以为"删了又回来了"（实测踩到）。
-              // liveOrphan = 磁盘已删 + 本进程内仍活着：这是删除后的**正常终态**，
-              // 重启 DSH 后会彻底消失，不需要也不应该反复点删除。
-              + (s.liveOrphan
-                  ? ' · 磁盘记录已删除；该会话在本进程内仍被平台持有（不会出现在侧栏），重启 DSH 后彻底消失'
-                  : (s.orphan ? ' · 磁盘上已不存在（仅清理归档记录）' : '')))),
+              // 磁盘已删的条目（非 live）说清真实状态，避免用户看到「0 B」的普通行
+              // 以为"删了又回来了"（实测踩到）。
+              // 注意：磁盘已删 **且 live** 的条目已不在本列表里 —— 宿主把它们归到
+              // pendingRestart 单列（那条路径才是删除后的正常终态）。
+              + (s.orphan ? ' · 磁盘上已不存在（仅清理归档记录）' : ''))),
           h('span', { className: 'asm-item-bytes' }, s.orphan ? '—' : formatBytes(s.sizeBytes)));
       }
 
@@ -714,6 +717,19 @@ window.__ModuleLoader__.load({
                 h('button', { type: 'button', className: 'asm-btn', onClick: previewRepair, disabled: repairing }, '重新预览'),
                 h('button', { type: 'button', className: 'asm-btn asm-btn-primary', onClick: doRepair, disabled: repairing },
                   repairing ? '归位中…' : '一键归位')))
+          : null,
+        // 「已删除，等待重启回收」的条目。
+        // ⚠️ 这一条必须与「归档会话列表」严格分开：平台**没有删除会话的 API**，
+        //    对仍 live 的会话我们只能保留归档标记来让侧栏隐藏它（否则它会掉进
+        //    「未分组」）。代价是该标记要等重启才能清掉。若把它当普通归档会话列在
+        //    上面，用户点「删除」→ 那一行原地不动 → 观感就是「删了又回来」（实测）。
+        (pendingRestart && pendingRestart.length > 0)
+          ? h('div', { className: 'asm-notice' },
+              h('span', { className: 'asm-notice-main' },
+                '有 ' + pendingRestart.length + ' 个会话已删除：磁盘记录已移除，它们也不会出现在侧栏。',
+                h('span', { className: 'asm-notice-detail' },
+                  '平台的会话对象在本进程内仍被持有（平台未提供删除会话的 API），'
+                  + '所以这个归档标记要等「重启 DSH」后才能清掉。这不是未完成的操作，无需重复删除。')))
           : null,
         // 磁盘遗留空会话：建了却从未用过（无任何 user/message）。
         // ⚠️ 这是唯一会**真正删除磁盘文件**的维护项 —— 语气必须与上面几个
