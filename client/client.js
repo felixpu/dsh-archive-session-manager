@@ -406,13 +406,18 @@ window.__ModuleLoader__.load({
           var parts = ['已删除 ' + okIds.size + ' 个会话'];
           if (freed) parts.push('释放 ' + freed);
           if (cleaned > 0) parts.push('其中 ' + cleaned + ' 个仅清理了归档记录（磁盘已无文件）');
-          // ⚠️ 如实告知平台限制：会话文件已删除，但平台内存仍持有该会话对象，
-          //    刷新页面时平台会把它重新并入列表。重启 DSH 后即彻底消失。
-          //    这不是插件能修的问题：平台的 AgentRegistry 没有对外暴露销毁入口。
-          if (liveCount > 0) parts.push('注意：' + liveCount + ' 个会话文件已删除，但它们在本进程内仍被平台持有，刷新页面可能再次出现；重启 DSH 后彻底消失');
+          // 关于 live 会话的如实告知（2026-10-12 修正）。
+          // 平台会把「本进程内存中仍存活的会话」并入列表（sessionQuery.listSessions
+          // 用 ctx.sessions.list() 覆盖合并），所以磁盘文件删掉后，只要它还 live，
+          // 刷新页面仍会被列出来。宿主侧现在对这类会话**保留归档标记且不摘记账**，
+          // 于是它被归档过滤器隐藏、且不会掉进「未分组」——侧栏观感是干净的。
+          // 但「删除」对它而言要到重启 DSH 后才彻底生效，必须如实说清。
+          if (liveCount > 0) parts.push('其中 ' + liveCount + ' 个会话在本进程内仍被平台持有：磁盘记录已删除、它们不会出现在侧栏（已保持在归档隐藏状态），重启 DSH 后彻底消失');
           if (warned > 0) parts.push(warned + ' 个的列表记账未能立即清理，重启 DSH 后自动收敛');
           setStatus(failures.length === 0
-            ? { kind: liveCount > 0 ? 'err' : 'info', text: parts.join('，') }
+            // live 不再是「错误」：宿主的处理已保证它不会污染侧栏，只是延迟到重启
+            // 才彻底消失。用 info 呈现（此前用 err 红字，会让用户以为删失败了）。
+            ? { kind: 'info', text: parts.join('，') }
             : { kind: 'err', text: '已删除 ' + okIds.size + ' 个，失败 ' + failures.length + ' 个：' + failures[0] });
         } catch (e) {
           setStatus({ kind: 'err', text: '批量删除失败：' + String(e && e.message || e) });
