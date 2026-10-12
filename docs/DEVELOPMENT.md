@@ -136,7 +136,7 @@ const sessionIds = changed.sessionIds.filter((id) => this.host.sessionPath(id) =
 | `/cleanup-ghosts` | POST | 清理失效的记账条目 |
 | `/repair` | POST | `attachSession` 归位，**跳过子智能体**，支持 `dryRun` |
 | `/detach-subagents` | POST | 只改记账，摘掉误记账的子智能体 |
-| `/empty-sessions` | POST | 列出/删除从未有过对话的空会话（服务端二次校验） |
+| `/empty-sessions` | POST | 列出/删除从未有过对话的空会话（服务端二次校验；**全库扫描，客户端按需触发**） |
 
 ## 六、客户端落点
 
@@ -174,8 +174,23 @@ const sessionIds = changed.sessionIds.filter((id) => this.host.sessionPath(id) =
   凡判「磁盘上有没有」，必须真的 `existsSync`/`stat`。
 - **会话日志是多帧 zstd，`zstdDecompressSync(整个 Buffer)` 只解第一帧**：
   实测一个 1.2 MB 的 `session.v4.jsonl.zstd` 含 **826 帧**，只解首帧仅得 288 字节 header，
-  会把**有真实对话的会话误判成空会话**。凡需「全部事件」的判断（如是否为空会话）
-  必须逐帧解（见 `readLogText`）。
+  会把**有真实对话的会话误判成空会话**。凡需知道「全部事件」的，必须逐帧解。
+- **判「有没有 user/message」必须逐帧解、且见到就停**（性能红线，勿退回全量）：
+  本机 67 个日志共约 45000 帧、解压后 225 MB，全量解压要 **6.2 s**；而该判据几乎在
+  第一个含消息的帧就成立 —— 提前退出后只需解 **0.6%** 的帧（实测 **6.2 s → 0.59 s**）。
+  见 `scanLogForUserMessage`。且因为 `zstdDecompressSync` 是**同步**的，全量解压会把
+  整个宿主进程卡住（实测期间并发 `/list` 从 3 ms 涨到 631 ms），故这里用**异步**解压。
+- **全库扫描不要在面板挂载时自动跑**：空会话检测要遍历全部会话日志，属重活。
+  `/empty-sessions` 的预览改为用户点「开始扫描」才执行，避免每次打开设置页都白等。
+- **删除父会话必须级联它的子智能体**：平台的删除是**会话级**的、没有级联，
+  而子智能体**从不作为列表行显示**（`sessionVisible` 直接 return false），
+  用户既看不到也没有入口清理 —— 实测本机 37 个子智能体里 36 个的父早已不在磁盘，
+  正是历次删除留下的孤儿。判据见下一条。
+- **判「是不是子智能体」只能用 `origin === 'subagent'`，不能只看 `parentSession` 非空**：
+  实测本机有 2 个会话带 `parentSession` 但 `origin` 为空（agentPreset 继承出的
+  **延续会话**，用户可见、侧栏有行）—— 按 `parentSession` 级联会连用户自己的会话
+  一起删掉。另注意 id 形态是**混合**的：`header.id` 有的是裸 uuid、有的带 `session-`
+  前缀，而 `parentSession` 一律带前缀，比较前必须归一化（见 `findSubagentDescendants`）。
 - **不要照抄平台的 `CANONICAL_LOG_FILENAME` 去扫磁盘**：平台那个常量
   （`dsh-session-format/lib/index.js:464`）匹配的是**逻辑名**（无压缩后缀），
   磁盘上的**物理名**要再拼 `.zstd`（由 `dsh-session-persistence-jsonl/lib/index.js:747-763`

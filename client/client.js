@@ -79,6 +79,8 @@ window.__ModuleLoader__.load({
       '.asm-notice-actions{flex:none;display:flex;align-items:center;gap:8px}',
       '.asm-notice-actions .asm-btn{white-space:nowrap}',
       '.asm-notice-detail{margin-top:4px;font-size:11px;color:var(--dsw-alias-label-secondary)}',
+      // 中性提示（不是警告）：用于「可选、尚未运行」的项，避免一进页面就一片告警色。
+      '.asm-notice-optional{border-color:var(--dsw-alias-border-l1);background:transparent}',
       '.asm-footer{display:flex;align-items:center;justify-content:space-between;gap:8px;border-top:.5px solid var(--dsw-alias-border-l1);padding-top:12px}',
       '.asm-status{font-size:12px;color:var(--dsw-alias-label-secondary)}',
       '.asm-status-err{color:var(--dsw-alias-state-error-primary)}',
@@ -269,7 +271,9 @@ window.__ModuleLoader__.load({
           h('p', { className: 'asm-desc' },
             '将永久删除会话 ',
             h('strong', null, '「' + pending.displayTitle + '」'),
-            ' 的全部记录（磁盘上的会话日志），此操作不可恢复。'),
+            ' 的全部记录（磁盘上的会话日志），此操作不可恢复。',
+            '它名下派生的子智能体会话也会一并删除（子智能体不作为列表行显示，'
+            + '平台不会自动级联，因此由本插件连带清理）。'),
           err ? h('p', { className: 'asm-desc asm-warn' }, err) : null,
           h('div', { className: 'asm-row-actions' },
             h('button', { type: 'button', className: 'asm-btn', onClick: close, disabled: busy }, '取消'),
@@ -316,6 +320,9 @@ window.__ModuleLoader__.load({
       var _emptiesErr = React.useState(''), emptiesError = _emptiesErr[0], setEmptiesError = _emptiesErr[1];
       var _emptiesBusy = React.useState(false), emptiesBusy = _emptiesBusy[0], setEmptiesBusy = _emptiesBusy[1];
       var _emptiesConfirm = React.useState(false), emptiesConfirm = _emptiesConfirm[0], setEmptiesConfirm = _emptiesConfirm[1];
+      // 是否已请求过「空会话」扫描（null=未扫；[]=扫过但无结果）。全库扫描成本高，
+      // 故不在挂载时自动跑，用户点「开始扫描」后才置 true。
+      var _emptiesScanned = React.useState(false), emptiesScanned = _emptiesScanned[0], setEmptiesScanned = _emptiesScanned[1];
       // 删除已执行、但当时驱逐失败的会话（磁盘已无、内存态仍在）。
       // 它们**不是**归档会话 —— 单列出来，绝不允许混进归档列表
       // （混进去会让用户点删除后那一行原地不动，观感就是「删了又回来」）。
@@ -359,8 +366,13 @@ window.__ModuleLoader__.load({
 
       /**
        * 拉空会话预览（只读）。异常咽进 emptiesError，不连坐面板其余部分。
+       *
+       * ⚠️ 这是**全库扫描**（宿主需遍历每个会话日志判断「有没有对话」，本机实测
+       *    ~70 MB / 数万帧），因此只由用户显式触发（「开始扫描」按钮），
+       *    不在面板挂载时自动跑 —— 否则每次打开设置页都要白等。
        */
       function previewEmpties() {
+        setEmptiesScanned(true);
         return apiEmptySessions(true).then(function (out) {
           var list = ((out && out.sessions) || []).filter(function (s) { return !!s; });
           setEmpties(list);
@@ -420,8 +432,10 @@ window.__ModuleLoader__.load({
       React.useEffect(function () { previewRepair(); }, []);
       // 同理并行预览「被误记账的子智能体」（独立路由，失败不连坐）。
       React.useEffect(function () { previewSubagents(); }, []);
-      // 同理并行预览「磁盘遗留空会话」（唯一会真删文件的项，需二次确认）。
-      React.useEffect(function () { previewEmpties(); }, []);
+      // ⚠️ 「磁盘遗留空会话」**故意不在这里自动预览**：它要遍历全部会话日志才能
+      //    判断「有没有对话」，是全库扫描（本机实测 ~70 MB、数万帧）。面板一打开
+      //    就跑它会明显拖慢首屏，且宿主的解压会占用 CPU。改为用户点「开始扫描」后
+      //    才执行（见下方渲染分支的按钮）。
 
       // 待归位条目（字段做容错：契约由宿主侧实现，缺字段、甚至数组里混入 null 时
       // 都不能让整个设置页崩掉 —— 归位是「锦上添花」的修复功能，绝不能连坐）。
@@ -499,6 +513,7 @@ window.__ModuleLoader__.load({
           var failures = [];
           var warned = 0;
           var liveCount = 0;
+          var subCount = 0;
           (out.results || []).forEach(function (r) {
             if (r.ok) {
               okIds.add(r.sessionId);
@@ -506,6 +521,8 @@ window.__ModuleLoader__.load({
               // 原本是 live（在浏览器里打开过）的会话：宿主内存仍持有它，
               // 平台下次列会话会把它并回列表（刷新即可看到），如实统计。
               if (r.wasLive) liveCount++;
+              // 连带删掉的子智能体会话数（它们本就不显示为列表行，但占磁盘）。
+              if (r.subagents) subCount += r.subagents;
             } else failures.push(r.error);
           });
           setItems(function (prev) { return (prev || []).filter(function (s) { return !okIds.has(s.sessionId); }); });
@@ -515,6 +532,9 @@ window.__ModuleLoader__.load({
           var cleaned = out.cleaned || 0;
           var parts = ['已删除 ' + okIds.size + ' 个会话'];
           if (freed) parts.push('释放 ' + freed);
+          // 子智能体会话一并删除（平台的删除是会话级的、不会级联；子智能体又从不
+          // 作为列表行显示，用户没有别的入口清理它们）。
+          if (subCount > 0) parts.push('连同 ' + subCount + ' 个子智能体会话');
           if (cleaned > 0) parts.push('其中 ' + cleaned + ' 个仅清理了归档记录（磁盘已无文件）');
           // 关于 live 会话的如实告知。
           // 平台会把「本进程内存中仍存活的会话」并入列表（sessionQuery.listSessions
@@ -791,7 +811,21 @@ window.__ModuleLoader__.load({
         // 磁盘遗留空会话：建了却从未用过（无任何 user/message）。
         // ⚠️ 这是唯一会**真正删除磁盘文件**的维护项 —— 语气必须与上面几个
         //    「只改记账」的提示区分开，并走两步确认。
-        (empties && empties.length > 0)
+        // ⚠️ 也是唯一**需要全库扫描**的项（要读每个会话日志才知道有没有对话），
+        //    因此不自动预览：未扫描时只给一个「开始扫描」按钮。
+        !emptiesScanned
+          ? h('div', { className: 'asm-notice asm-notice-optional' },
+              h('span', { className: 'asm-notice-main' },
+                '清理遗留空会话',
+                h('span', { className: 'asm-notice-detail' },
+                  '找出「建了但从未有过对话」的会话目录并删除。需要扫描全部会话日志，'
+                  + '可能耗时几秒 —— 因此不自动运行。')),
+              h('span', { className: 'asm-notice-actions' },
+                h('button', { type: 'button', className: 'asm-btn', disabled: emptiesBusy,
+                  onClick: function () { setEmptiesBusy(true); previewEmpties().finally(function () { setEmptiesBusy(false); }); } },
+                  emptiesBusy ? '扫描中…' : '开始扫描')))
+          : null,
+        (emptiesScanned && empties && empties.length > 0)
           ? h('div', { className: 'asm-notice' },
               h('span', { className: 'asm-notice-main' },
                 '检测到 ' + empties.length + ' 个遗留空会话（建了但从未有过对话，共 '
@@ -810,9 +844,12 @@ window.__ModuleLoader__.load({
                   : h('button', { type: 'button', className: 'asm-btn',
                       disabled: emptiesBusy, onClick: function () { setEmptiesConfirm(true); } }, '清理空会话')))
           : null,
+        (emptiesScanned && empties && empties.length === 0 && !emptiesError)
+          ? h('p', { className: 'asm-status' }, '已扫描：没有发现遗留空会话。')
+          : null,
         emptiesError
           ? h('p', { className: 'asm-status asm-status-err' },
-              '空会话预览不可用（宿主 /empty-sessions 路由无响应）：' + emptiesError)
+              '空会话扫描不可用（宿主 /empty-sessions 路由无响应）：' + emptiesError)
           : null,
         // 子智能体污染提示：子智能体不该占用用户工作区的归属记账槽位
         // （侧栏也不把它们显示为列表行，只在父会话上以计数徽标出现）。
@@ -851,7 +888,9 @@ window.__ModuleLoader__.load({
         status ? h('p', { className: 'asm-status' + (status.kind === 'err' ? ' asm-status-err' : '') }, status.text) : null,
         confirming
           ? h('p', { className: 'asm-desc asm-warn' },
-              '确认永久删除选中的 ' + selectedIds.length + ' 个会话？磁盘记录不可恢复。')
+              '确认永久删除选中的 ' + selectedIds.length + ' 个会话？磁盘记录不可恢复。'
+              + '它们名下派生的子智能体会话也会一并删除（子智能体不作为列表行显示，'
+              + '平台不会自动级联，因此由本插件连带清理）。')
           : null,
         h('div', { className: 'asm-footer' },
           h('span', { className: 'asm-status' },
