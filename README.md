@@ -5,6 +5,7 @@
 - 会话「···」菜单里，**已归档**的会话多一项「删除会话」（带确认对话框，永久删除磁盘记录）。
 - **设置 → 归档会话**：独立设置页，列出全部归档会话（标题 / 时间 / 目录 / 磁盘占用），支持**多选、全选、批量删除、批量取消归档**与刷新。
 - **归位失效会话**：把「磁盘上有、但不在任何工作区记账里」的会话（它们会显示在侧栏「未分组」）重新挂回 cwd 对应的工作区。只修归属，不删文件；子智能体会被自动跳过（侧栏本就不显示它们）。
+- **一键摘除误记账的子智能体**：子智能体不该占用用户工作区的归属槽位（侧栏也不把它们显示为列表行，只在父会话上以计数徽标出现）。若历史版本把子智能体挂进了记账，这里可一键摘除，只改记账、不动磁盘。
 
 入口放在设置页而非侧栏：这是低频的批量维护操作，不是会话内的日常动作。
 
@@ -94,8 +95,8 @@ const sessionIds = changed.sessionIds.filter((id) => this.host.sessionPath(id) =
 
 | 半身 | 文件 | 职责 |
 |---|---|---|
-| 宿主 | `lib/index.js` | 四条同源路由：`GET /api/dsh-archive-session-manager/list`（列出归档会话 + 工作区 + 幽灵记账）、`POST .../delete`（校验 → 删目录 → `detachSession` 摘记账 → 清归档标记 → 发 `api-session/removed` 通知前端即时移除行）、`POST .../cleanup-ghosts`（清理磁盘已无却仍留在记账里的历史遗留）、`POST .../repair`（把「磁盘有、记账无」的会话用 `attachSession` 归位，支持 `dryRun` 预览；不删任何文件） |
-| 客户端 | `client/client.js` | ① `sidebar.workspaces.session.menu.item` 注册「删除会话」（order 500，danger 样式，仅归档行可见）② `settings.section` 注册「归档会话」设置页（order 65，按工作区分组的批量管理正文）③ `shell.overlay` 注册单个删除的确认对话框 |
+| 宿主 | `lib/index.js` | 五条同源路由：`GET /api/dsh-archive-session-manager/list`（列出归档会话 + 工作区 + 幽灵记账）、`POST .../delete`（校验 → 删目录 → **live 会话保留归档态与归属 / 冷会话 `detachSession` 摘记账** → 发 `api-session/removed` 通知前端即时移除行）、`POST .../cleanup-ghosts`（清理磁盘已无却仍留在记账里的历史遗留）、`POST .../repair`（把「磁盘有、记账无」的会话用 `attachSession` 归位，**跳过子智能体**，支持 `dryRun` 预览；不删任何文件）、`POST .../detach-subagents`（把被误记账的子智能体从工作区归属中摘除，只改记账不动磁盘） |
+| 客户端 | `client/client.js` | ① `sidebar.workspaces.session.menu.item` 注册「删除会话」（order 500，danger 样式，仅归档行可见）② `settings.section` 注册「归档会话」设置页（order 65，按工作区分组的批量管理正文，另含「归位失效会话」「一键摘除误记账的子智能体」两个维护入口）③ `shell.overlay` 注册单个删除的确认对话框 |
 
 ## 已知坑（开发时实测）
 

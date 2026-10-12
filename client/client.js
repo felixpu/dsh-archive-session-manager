@@ -128,6 +128,22 @@ window.__ModuleLoader__.load({
       if (!res.ok) throw new Error('cleanup http ' + res.status);
       return res.json();
     }
+    /**
+     * 清理「被误记账的子智能体」：把子智能体从工作区归属记账里摘掉。
+     * 子智能体不该占用用户工作区的归属槽位（侧栏也不把它们显示为列表行），
+     * 本插件的 /repair 早期版本曾误挂入，这里提供清理入口。
+     * 只改记账、不动磁盘文件；dryRun=true 为只读预览。
+     */
+    async function apiDetachSubagents(dryRun) {
+      var res = await fetch(API + '/detach-subagents', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(dryRun ? { dryRun: true } : {}),
+      });
+      if (!res.ok) throw new Error('detach-subagents http ' + res.status);
+      return res.json();
+    }
     async function apiDelete(sessionIds) {
       var res = await fetch(API + '/delete', {
         method: 'POST',
@@ -271,6 +287,11 @@ window.__ModuleLoader__.load({
       var _repairErr = React.useState(''), repairError = _repairErr[0], setRepairError = _repairErr[1];
       var _repairing = React.useState(false), repairing = _repairing[0], setRepairing = _repairing[1];
       var _repairMsg = React.useState(null), repairMsg = _repairMsg[0], setRepairMsg = _repairMsg[1]; // { kind:'info'|'err', text }
+      // 被误记账的子智能体：「本不该占用工作区归属槽位」的脏数据。
+      // 同样是独立路由，失败只落在 subagentError，不连坐归档列表。
+      var _subs = React.useState(null), subs = _subs[0], setSubs = _subs[1];
+      var _subsErr = React.useState(''), subagentError = _subsErr[0], setSubagentError = _subsErr[1];
+      var _detaching = React.useState(false), detaching = _detaching[0], setDetaching = _detaching[1];
 
       /**
        * 拉归位预览（只读）。任何异常都咽进 repairError，不抛给调用方。
@@ -287,6 +308,23 @@ window.__ModuleLoader__.load({
           setRepair([]);
           setRepairError(String((e && e.message) || e));
           return [];
+        });
+      }
+
+      /**
+       * 拉子智能体污染预览（只读）。异常咽进 subagentError，不抛给调用方。
+       * @returns { total, groups }（失败时 total=0, groups=[]）
+       */
+      function previewSubagents() {
+        return apiDetachSubagents(true).then(function (out) {
+          var res = { total: (out && out.total) || 0, groups: (out && out.groups) || [] };
+          setSubs(res);
+          setSubagentError('');
+          return res;
+        }).catch(function (e) {
+          setSubs({ total: 0, groups: [] });
+          setSubagentError(String((e && e.message) || e));
+          return { total: 0, groups: [] };
         });
       }
 
@@ -312,6 +350,8 @@ window.__ModuleLoader__.load({
       // 挂载时并行预览「待归位会话」：与 load() 的 /list 互不等待、互不影响
       // （失败只体现在 repairError 上，面板其余部分照常可用）。
       React.useEffect(function () { previewRepair(); }, []);
+      // 同理并行预览「被误记账的子智能体」（独立路由，失败不连坐）。
+      React.useEffect(function () { previewSubagents(); }, []);
 
       // 待归位条目（字段做容错：契约由宿主侧实现，缺字段、甚至数组里混入 null 时
       // 都不能让整个设置页崩掉 —— 归位是「锦上添花」的修复功能，绝不能连坐）。
@@ -459,6 +499,30 @@ window.__ModuleLoader__.load({
       }
 
       /**
+       * 执行「摘除误记账的子智能体」。只改记账归属，**不删任何磁盘文件**
+       * （子智能体的会话文件本就该留在磁盘上，只是不该占用用户工作区的归属槽位）。
+       */
+      async function doDetachSubagents() {
+        setDetaching(true); setStatus(null);
+        try {
+          var out = await apiDetachSubagents(false);
+          var removed = (out && out.detached) || 0;
+          // 有失败项时如实并列，不谎报全成功。
+          var fails = ((out && out.results) || []).filter(function (r) { return r && r.ok === false; });
+          setStatus(fails.length === 0
+            ? { kind: 'info', text: '已从工作区记账中摘除 ' + removed + ' 个子智能体（会话文件未动）' }
+            : { kind: 'err', text: '已摘除 ' + removed + ' 个，失败 ' + fails.length + ' 个：' + (fails[0].error || '未知错误') });
+          // 记账变了 → 重拉面板与预览。
+          load();
+          previewSubagents();
+        } catch (e) {
+          setStatus({ kind: 'err', text: '摘除失败：' + String((e && e.message) || e) });
+        } finally {
+          setDetaching(false);
+        }
+      }
+
+      /**
        * 执行归位。与「清理幽灵记账」的关键区别：这一步**只写记账、不删任何文件**
        * （宿主侧靠 attachSession 把会话挂到 cwd 对应的工作区上）。
        */
@@ -577,6 +641,25 @@ window.__ModuleLoader__.load({
                 h('button', { type: 'button', className: 'asm-btn', onClick: previewRepair, disabled: repairing }, '重新预览'),
                 h('button', { type: 'button', className: 'asm-btn asm-btn-primary', onClick: doRepair, disabled: repairing },
                   repairing ? '归位中…' : '一键归位')))
+          : null,
+        // 子智能体污染提示：子智能体不该占用用户工作区的归属记账槽位
+        // （侧栏也不把它们显示为列表行，只在父会话上以计数徽标出现）。
+        // 本插件的 /repair 早期版本曾误把它们挂入，这里提供清理入口。
+        // 采用与「归位」相同的「无害修复」语气：只改记账，绝不删文件。
+        (subs && subs.total > 0)
+          ? h('div', { className: 'asm-notice' },
+              h('span', { className: 'asm-notice-main' },
+                '检测到 ' + subs.total + ' 个子智能体被记在了工作区归属里（它们本不该占用工作区的会话槽位）。',
+                h('span', { className: 'asm-notice-detail' },
+                  '摘除只修改列表归属记账，不删除任何会话文件；子智能体仍属于其父会话。')),
+              h('span', { className: 'asm-notice-actions' },
+                h('button', { type: 'button', className: 'asm-btn', onClick: previewSubagents, disabled: detaching }, '重新预览'),
+                h('button', { type: 'button', className: 'asm-btn asm-btn-primary', onClick: doDetachSubagents, disabled: detaching },
+                  detaching ? '摘除中…' : '一键摘除')))
+          : null,
+        subagentError
+          ? h('p', { className: 'asm-status asm-status-err' },
+              '子智能体预览不可用（宿主 /detach-subagents 路由无响应）：' + subagentError)
           : null,
         // repair 路由不可用（旧宿主/路由未注册）时如实说明，不假装「没有待归位项」。
         // 用 asm-status 而非 asm-notice：它不是可操作的提示，只是信息缺失的告知。
