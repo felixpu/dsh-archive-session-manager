@@ -322,9 +322,15 @@ window.__ModuleLoader__.load({
           var okIds = new Set();
           var failures = [];
           var warned = 0;
+          var liveCount = 0;
           (out.results || []).forEach(function (r) {
-            if (r.ok) { okIds.add(r.sessionId); if (r.warnings && r.warnings.length) warned++; }
-            else failures.push(r.error);
+            if (r.ok) {
+              okIds.add(r.sessionId);
+              if (r.warnings && r.warnings.length) warned++;
+              // 原本是 live（在浏览器里打开过）的会话：宿主内存仍持有它，
+              // 平台下次列会话会把它并回列表（刷新即可看到），如实统计。
+              if (r.wasLive) liveCount++;
+            } else failures.push(r.error);
           });
           setItems(function (prev) { return (prev || []).filter(function (s) { return !okIds.has(s.sessionId); }); });
           setSel({}); setConfirming(false);
@@ -334,9 +340,13 @@ window.__ModuleLoader__.load({
           var parts = ['已删除 ' + okIds.size + ' 个会话'];
           if (freed) parts.push('释放 ' + freed);
           if (cleaned > 0) parts.push('其中 ' + cleaned + ' 个仅清理了归档记录（磁盘已无文件）');
+          // ⚠️ 如实告知平台限制：会话文件已删除，但平台内存仍持有该会话对象，
+          //    刷新页面时平台会把它重新并入列表。重启 DSH 后即彻底消失。
+          //    这不是插件能修的问题：平台的 AgentRegistry 没有对外暴露销毁入口。
+          if (liveCount > 0) parts.push('注意：' + liveCount + ' 个会话文件已删除，但它们在本进程内仍被平台持有，刷新页面可能再次出现；重启 DSH 后彻底消失');
           if (warned > 0) parts.push(warned + ' 个的列表记账未能立即清理，重启 DSH 后自动收敛');
           setStatus(failures.length === 0
-            ? { kind: 'info', text: parts.join('，') }
+            ? { kind: liveCount > 0 ? 'err' : 'info', text: parts.join('，') }
             : { kind: 'err', text: '已删除 ' + okIds.size + ' 个，失败 ' + failures.length + ' 个：' + failures[0] });
         } catch (e) {
           setStatus({ kind: 'err', text: '批量删除失败：' + String(e && e.message || e) });
