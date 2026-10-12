@@ -580,7 +580,13 @@ window.__ModuleLoader__.load({
             h('span', { className: 'asm-item-title' }, s.title || '（无标题会话）'),
             h('span', { className: 'asm-item-meta' },
               formatTime(s.createdAt)
-              + (s.orphan ? ' · 磁盘上已不存在（仅清理归档记录）' : ''))),
+              // 磁盘已删的条目要说清它的**真实状态**，否则用户看到「0 B」的普通行
+              // 会以为"删了又回来了"（实测踩到）。
+              // liveOrphan = 磁盘已删 + 本进程内仍活着：这是删除后的**正常终态**，
+              // 重启 DSH 后会彻底消失，不需要也不应该反复点删除。
+              + (s.liveOrphan
+                  ? ' · 磁盘记录已删除；该会话在本进程内仍被平台持有（不会出现在侧栏），重启 DSH 后彻底消失'
+                  : (s.orphan ? ' · 磁盘上已不存在（仅清理归档记录）' : '')))),
           h('span', { className: 'asm-item-bytes' }, s.orphan ? '—' : formatBytes(s.sizeBytes)));
       }
 
