@@ -9,10 +9,12 @@
 //    归档判定用 standardProps 的 useWorkspaces（快照含 archivedSessionIds），
 //    与官方 ArchiveSessionMenuItem 的 useArchived 同源（都是 workspaces.list 的 derive）。
 //
-// 2) 批量管理入口 = `sidebar.footer.action` 槽（侧栏底部，紧挨设置）。
+// 2) 批量管理正文 = `settings.section` 设置页（id 借用 'archived-sessions'，
+//    原因见该注册处；order 65）。**不是** sidebar.footer.action —— 早期版本曾计划
+//    放侧栏底部，后改为设置页（低频批量维护，不是会话内日常动作）。
 //
-// 3) 确认对话框 + 批量管理面板 = `shell.overlay` 槽（全屏浮层，click-through，
-//    条目需自行 opt-in pointer events）。
+// 3) 单个删除的确认对话框 = `shell.overlay` 槽（全屏浮层，click-through，
+//    条目需自行 opt-in pointer events）。批量管理面板已移入上面第 2 项。
 //
 // ⚠️ 只允许 require 平台种子表 9 项内的模块；slots 服务走 package.json
 //    里 dsh.client.inject 声明的 "@deepseek-ai/dsh-client-ui-slots"。
