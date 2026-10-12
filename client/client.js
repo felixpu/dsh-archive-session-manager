@@ -863,11 +863,22 @@ window.__ModuleLoader__.load({
 
         // 2) 设置页：归档会话管理（独立一页，与「插件」等页并列）。
         //    放在设置里而不是侧栏：这是低频批量维护，不是会话内日常动作。
+        //
+        //    ⚠️ id 为什么是 'archived-sessions' 而不是包名（实证，勿"顺手改回来"）：
+        //    settings.section 的注册选项只有 id/order/label，**没有 icon 字段**
+        //    （契约见 cordis_inspect_query client/Slots root=settings.section；
+        //     实现见 dsh-client-ui-settings-general 的 navIcon(id) —— 它按 id
+        //     硬编码 account/models/agent-presets/plugins/archived-sessions 五个图标，
+        //     其余 id 一律兜底齿轮）。所以想拿到档案盒图标而不是齿轮，只能借用这个
+        //     官方预留的 id。全安装树扫描：该字符串仅出现在 navIcon 那一处，**无人注册**
+        //     （官方没有归档设置页），故此 id 当前空缺，语义又与「归档会话」恰好吻合。
+        //    代价：list 槽同 id 是**替换而非并列**，若官方将来真出了归档页会互相顶掉，
+        //     届时改回包名即可（纯登记信息，不影响菜单/路由/批量删除等任何功能）。
         try {
           ctx.slots.inject('settings.section', function () {
             return ctx.slots.register({
               name: 'settings.section',
-              id: 'dsh-archive-session-manager',
+              id: 'archived-sessions',
               order: 65,
               label: '归档会话',
             }, ArchiveManagerSection);
