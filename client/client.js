@@ -68,10 +68,15 @@ window.__ModuleLoader__.load({
       '.asm-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px}',
       '.asm-toolbar-label{font-size:12px;color:var(--dsw-alias-label-secondary)}',
       '.asm-empty{padding:32px 0;text-align:center;font-size:13px;color:var(--dsw-alias-label-secondary)}',
-      // 提示条（幽灵记账清理）
+      // 提示条（幽灵记账清理 / 未记账会话归位）
       '.asm-notice{display:flex;align-items:center;gap:12px;justify-content:space-between;padding:10px 12px;border-radius:10px;',
       'border:.5px solid var(--dsw-alias-state-warn-primary);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 10%,transparent);',
       'font-size:12px;line-height:1.55;color:var(--dsw-alias-label-primary)}',
+      // 提示条正文：占满剩余宽度；右侧只放按钮，按钮不许被压扁或换行。
+      '.asm-notice-main{flex:1;min-width:0}',
+      '.asm-notice-actions{flex:none;display:flex;align-items:center;gap:8px}',
+      '.asm-notice-actions .asm-btn{white-space:nowrap}',
+      '.asm-notice-detail{margin-top:4px;font-size:11px;color:var(--dsw-alias-label-secondary)}',
       '.asm-footer{display:flex;align-items:center;justify-content:space-between;gap:8px;border-top:.5px solid var(--dsw-alias-border-l1);padding-top:12px}',
       '.asm-status{font-size:12px;color:var(--dsw-alias-label-secondary)}',
       '.asm-status-err{color:var(--dsw-alias-state-error-primary)}',
@@ -131,6 +136,21 @@ window.__ModuleLoader__.load({
         body: JSON.stringify({ sessionIds: sessionIds }),
       });
       if (!res.ok) throw new Error('delete http ' + res.status);
+      return res.json();
+    }
+    /**
+     * 归位：把「磁盘上有、但不在任何工作区记账里」的会话挂回它 cwd 对应的工作区。
+     * 这类会话没有归属，平台侧栏只能把它们统统塞进「未分组」。
+     * dryRun=true 是**只读预览**，宿主不写任何状态（按钮上也要向用户说清这一点）。
+     */
+    async function apiRepair(dryRun) {
+      var res = await fetch(API + '/repair', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(dryRun ? { dryRun: true } : {}),
+      });
+      if (!res.ok) throw new Error('repair http ' + res.status);
       return res.json();
     }
 
@@ -241,6 +261,34 @@ window.__ModuleLoader__.load({
       var _confirming = React.useState(false), confirming = _confirming[0], setConfirming = _confirming[1];
       // 幽灵记账：工作区里记着、磁盘上已无的会话（历史手工删除的遗留）。
       var _ghosts = React.useState(null), ghosts = _ghosts[0], setGhosts = _ghosts[1];
+      // 未记账会话（归位）预览：磁盘上有、但不在任何工作区记账里的会话。
+      // 它们没有归属，平台侧栏只能显示成「未分组」。
+      // 两个状态分开存的原因：repair 是**独立于 /list 的第二条路由**，它可能单独失败
+      // （宿主版本旧、路由缺失…）。若把清单和错误合成一个状态，一旦 repair 失败
+      // 就把整个面板打成错误态，用户连归档列表都用不了 —— 故 repair 的失败只落在
+      // repairError 上，绝不影响上面 load() 的结果。
+      var _repair = React.useState(null), repair = _repair[0], setRepair = _repair[1];
+      var _repairErr = React.useState(''), repairError = _repairErr[0], setRepairError = _repairErr[1];
+      var _repairing = React.useState(false), repairing = _repairing[0], setRepairing = _repairing[1];
+      var _repairMsg = React.useState(null), repairMsg = _repairMsg[0], setRepairMsg = _repairMsg[1]; // { kind:'info'|'err', text }
+
+      /**
+       * 拉归位预览（只读）。任何异常都咽进 repairError，不抛给调用方。
+       * @returns 待归位条目数组（失败时为空数组）
+       */
+      function previewRepair() {
+        return apiRepair(true).then(function (out) {
+          var list = (out && out.items) || [];
+          setRepair(list);
+          setRepairError('');
+          return list;
+        }).catch(function (e) {
+          // 这条路由可能不存在（旧宿主）：如实记录，但不打扰用户主动操作。
+          setRepair([]);
+          setRepairError(String((e && e.message) || e));
+          return [];
+        });
+      }
 
       function load() {
         setItems(null); setSel({}); setStatus(null); setConfirming(false); setGhosts(null);
@@ -261,6 +309,24 @@ window.__ModuleLoader__.load({
       }
       // 打开设置页即拉取（依赖为空 → 只在挂载时跑一次）。
       React.useEffect(load, []);
+      // 挂载时并行预览「待归位会话」：与 load() 的 /list 互不等待、互不影响
+      // （失败只体现在 repairError 上，面板其余部分照常可用）。
+      React.useEffect(function () { previewRepair(); }, []);
+
+      // 待归位条目（字段做容错：契约由宿主侧实现，缺字段、甚至数组里混入 null 时
+      // 都不能让整个设置页崩掉 —— 归位是「锦上添花」的修复功能，绝不能连坐）。
+      var repairItems = ((repair && repair.length) ? repair : []).filter(function (it) { return !!it; });
+      // 只统计真正会被归位的：action 为 skip 的项（cwd 已消失、无法解析）执行后也不会变，
+      // 若一起计数，用户会看到「点了按钮却少归位几个」而不知道为什么。
+      var repairable = repairItems.filter(function (it) { return it.action !== 'skip'; });
+      var repairCreates = repairable.filter(function (it) { return it.action === 'create-workspace'; }).length;
+      // 目标工作区概要：按标题去重后取前几个。
+      var repairTargets = [];
+      for (var ri = 0; ri < repairable.length; ri++) {
+        var rTitle = repairable[ri].targetTitle || repairable[ri].resolvedCwd || repairable[ri].cwd || '';
+        if (rTitle && repairTargets.indexOf(rTitle) === -1) repairTargets.push(rTitle);
+      }
+      var repairTargetText = repairTargets.slice(0, 3).join('、') + (repairTargets.length > 3 ? ' 等' : '');
 
       var selectedIds = Object.keys(sel).filter(function (k) { return sel[k]; });
       var allSelected = !!items && items.length > 0 && selectedIds.length === items.length;
@@ -387,7 +453,44 @@ window.__ModuleLoader__.load({
         }
       }
 
-      // 单行会话（组内复用）
+      /**
+       * 执行归位。与「清理幽灵记账」的关键区别：这一步**只写记账、不删任何文件**
+       * （宿主侧靠 attachSession 把会话挂到 cwd 对应的工作区上）。
+       */
+      async function doRepair() {
+        setRepairing(true); setRepairMsg(null);
+        try {
+          var out = await apiRepair(false);
+          var results = (out && out.results) || [];
+          var okCount = 0;
+          var errors = [];
+          for (var i = 0; i < results.length; i++) {
+            var r = results[i] || {};
+            if (r.ok) okCount++; else if (r.error) errors.push(r.error);
+          }
+          var created = (out && out.createdWorkspaces) || 0;
+          // attached 是宿主侧「真正挂上的数量」，比 results 更权威；缺字段时退回 okCount。
+          var attached = out && out.attached !== undefined && out.attached !== null ? out.attached : okCount;
+          if (errors.length > 0) {
+            // 如实汇报：部分成功要同时给出成功数、失败数与第一条原因。
+            setRepairMsg({ kind: 'err', text: '已归位 ' + okCount + ' 个，失败 ' + errors.length + ' 个：' + errors[0] });
+          } else {
+            var parts = ['已归位 ' + attached + ' 个会话'];
+            if (created > 0) parts.push('新建 ' + created + ' 个工作区');
+            setRepairMsg({ kind: 'info', text: parts.join('，') });
+          }
+          // 刷新面板状态：/list 里的未分组分组会随之变化，
+          // 同时重新预览（正常情况下列表清空，提示条自动消失）。
+          load();
+          previewRepair();
+        } catch (e) {
+          setRepairMsg({ kind: 'err', text: '归位失败：' + String((e && e.message) || e) });
+        } finally {
+          setRepairing(false);
+        }
+      }
+
+
       // 只有**正在执行任务**（running）的会话禁止勾选：宿主会拒绝（session-running）。
       // 注意区分 live 与 running：被打开过的会话会常驻为 live agent 但通常处于
       // idle（没在跑任务），那种情况是可以安全删除的（实测反馈：live 一概拒绝
@@ -453,6 +556,31 @@ window.__ModuleLoader__.load({
                 + '它们会在侧栏显示为空会话。'),
               h('button', { type: 'button', className: 'asm-btn', onClick: doCleanupGhosts, disabled: busy },
                 busy ? '清理中…' : '清理'))
+          : null,
+        // 归位提示：磁盘上有、但不在任何工作区记账里的会话 —— 平台侧栏只能把它们
+        // 显示在「未分组」里，用户无法自行归位。这一块只新增面板内容，绝不改动
+        // 归档列表本身的渲染（列表在 /list 里可能并不包含这些会话）。
+        repairable.length > 0
+          ? h('div', { className: 'asm-notice' },
+              h('span', { className: 'asm-notice-main' },
+                '检测到 ' + repairable.length + ' 个会话不在任何工作区记账里（会显示在侧栏「未分组」），可一键归位。'
+                + (repairCreates > 0 ? '其中 ' + repairCreates + ' 个需要新建工作区。' : '')
+                + (repairTargetText ? '归入：' + repairTargetText : ''),
+                h('span', { className: 'asm-notice-detail' },
+                  '归位只修复列表归属（把这些会话挂到其工作目录对应的工作区），不删除任何文件；预览是只读的。')),
+              h('span', { className: 'asm-notice-actions' },
+                h('button', { type: 'button', className: 'asm-btn', onClick: previewRepair, disabled: repairing }, '重新预览'),
+                h('button', { type: 'button', className: 'asm-btn asm-btn-primary', onClick: doRepair, disabled: repairing },
+                  repairing ? '归位中…' : '一键归位')))
+          : null,
+        // repair 路由不可用（旧宿主/路由未注册）时如实说明，不假装「没有待归位项」。
+        // 用 asm-status 而非 asm-notice：它不是可操作的提示，只是信息缺失的告知。
+        repairError
+          ? h('p', { className: 'asm-status asm-status-err' },
+              '归位预览不可用（宿主 /repair 路由无响应）：' + repairError)
+          : null,
+        repairMsg
+          ? h('p', { className: 'asm-status' + (repairMsg.kind === 'err' ? ' asm-status-err' : '') }, repairMsg.text)
           : null,
         h('div', { className: 'asm-toolbar' },
           h('label', { className: 'asm-item', style: { padding: '4px 0' } },
