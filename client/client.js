@@ -144,6 +144,22 @@ window.__ModuleLoader__.load({
       if (!res.ok) throw new Error('detach-subagents http ' + res.status);
       return res.json();
     }
+    /**
+     * 磁盘遗留空会话：建了却从未用过（无任何 user/message）的会话目录。
+     * 与 /repair、/detach-subagents 不同，这个接口**真删磁盘目录**，
+     * 因此只由用户显式点击触发，且宿主会二次校验（有内容的会话一律拒删）。
+     */
+    async function apiEmptySessions(dryRun, sessionIds) {
+      var body = dryRun ? { dryRun: true } : (sessionIds ? { sessionIds: sessionIds } : {});
+      var res = await fetch(API + '/empty-sessions', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error('empty-sessions http ' + res.status);
+      return res.json();
+    }
     async function apiDelete(sessionIds) {
       var res = await fetch(API + '/delete', {
         method: 'POST',
@@ -292,6 +308,12 @@ window.__ModuleLoader__.load({
       var _subs = React.useState(null), subs = _subs[0], setSubs = _subs[1];
       var _subsErr = React.useState(''), subagentError = _subsErr[0], setSubagentError = _subsErr[1];
       var _detaching = React.useState(false), detaching = _detaching[0], setDetaching = _detaching[1];
+      // 磁盘遗留空会话（建了没用过）。这是唯一会**真删文件**的维护项，
+      // 因此需要单独确认态，不与其它「只改记账」的操作共用 confirming。
+      var _empties = React.useState(null), empties = _empties[0], setEmpties = _empties[1];
+      var _emptiesErr = React.useState(''), emptiesError = _emptiesErr[0], setEmptiesError = _emptiesErr[1];
+      var _emptiesBusy = React.useState(false), emptiesBusy = _emptiesBusy[0], setEmptiesBusy = _emptiesBusy[1];
+      var _emptiesConfirm = React.useState(false), emptiesConfirm = _emptiesConfirm[0], setEmptiesConfirm = _emptiesConfirm[1];
 
       /**
        * 拉归位预览（只读）。任何异常都咽进 repairError，不抛给调用方。
@@ -328,6 +350,22 @@ window.__ModuleLoader__.load({
         });
       }
 
+      /**
+       * 拉空会话预览（只读）。异常咽进 emptiesError，不连坐面板其余部分。
+       */
+      function previewEmpties() {
+        return apiEmptySessions(true).then(function (out) {
+          var list = ((out && out.sessions) || []).filter(function (s) { return !!s; });
+          setEmpties(list);
+          setEmptiesError('');
+          return list;
+        }).catch(function (e) {
+          setEmpties([]);
+          setEmptiesError(String((e && e.message) || e));
+          return [];
+        });
+      }
+
       function load() {
         setItems(null); setSel({}); setStatus(null); setConfirming(false); setGhosts(null);
         apiList().then(function (out) {
@@ -352,6 +390,8 @@ window.__ModuleLoader__.load({
       React.useEffect(function () { previewRepair(); }, []);
       // 同理并行预览「被误记账的子智能体」（独立路由，失败不连坐）。
       React.useEffect(function () { previewSubagents(); }, []);
+      // 同理并行预览「磁盘遗留空会话」（唯一会真删文件的项，需二次确认）。
+      React.useEffect(function () { previewEmpties(); }, []);
 
       // 待归位条目（字段做容错：契约由宿主侧实现，缺字段、甚至数组里混入 null 时
       // 都不能让整个设置页崩掉 —— 归位是「锦上添花」的修复功能，绝不能连坐）。
@@ -523,6 +563,33 @@ window.__ModuleLoader__.load({
       }
 
       /**
+       * 删除磁盘遗留空会话。**这是真删磁盘目录**（不可恢复），
+       * 所以走两步确认（emptiesConfirm），且宿主会二次校验「确实没有 user/message」——
+       * 有内容的会话一律拒删，前端传来的 id 不被信任。
+       */
+      async function doDeleteEmpties() {
+        setEmptiesBusy(true); setStatus(null);
+        try {
+          var out = await apiEmptySessions(false);
+          var deleted = (out && out.deleted) || 0;
+          var freed = (out && out.freedBytes) ? formatBytes(out.freedBytes) : '';
+          var fails = ((out && out.results) || []).filter(function (r) { return r && r.ok === false; });
+          var parts = ['已删除 ' + deleted + ' 个遗留空会话'];
+          if (freed) parts.push('释放 ' + freed);
+          if (fails.length > 0) parts.push('跳过 ' + fails.length + ' 个（' + (fails[0].error || '') + '）');
+          setStatus(fails.length === 0
+            ? { kind: 'info', text: parts.join('，') }
+            : { kind: 'err', text: parts.join('，') });
+          setEmptiesConfirm(false);
+          load(); previewEmpties();
+        } catch (e) {
+          setStatus({ kind: 'err', text: '删除空会话失败：' + String((e && e.message) || e) });
+        } finally {
+          setEmptiesBusy(false);
+        }
+      }
+
+      /**
        * 执行归位。与「清理幽灵记账」的关键区别：这一步**只写记账、不删任何文件**
        * （宿主侧靠 attachSession 把会话挂到 cwd 对应的工作区上）。
        */
@@ -647,6 +714,32 @@ window.__ModuleLoader__.load({
                 h('button', { type: 'button', className: 'asm-btn', onClick: previewRepair, disabled: repairing }, '重新预览'),
                 h('button', { type: 'button', className: 'asm-btn asm-btn-primary', onClick: doRepair, disabled: repairing },
                   repairing ? '归位中…' : '一键归位')))
+          : null,
+        // 磁盘遗留空会话：建了却从未用过（无任何 user/message）。
+        // ⚠️ 这是唯一会**真正删除磁盘文件**的维护项 —— 语气必须与上面几个
+        //    「只改记账」的提示区分开，并走两步确认。
+        (empties && empties.length > 0)
+          ? h('div', { className: 'asm-notice' },
+              h('span', { className: 'asm-notice-main' },
+                '检测到 ' + empties.length + ' 个遗留空会话（建了但从未有过对话，共 '
+                + formatBytes(empties.reduce(function (a, s) { return a + (s.sizeBytes || 0); }, 0)) + '）。',
+                h('span', { className: 'asm-notice-detail' },
+                  emptiesConfirm
+                    ? '确认永久删除这些磁盘记录？不可恢复。'
+                    : '删除会永久移除它们的磁盘记录（不可恢复）；宿主会拒绝删除任何有对话内容的会话。')),
+              h('span', { className: 'asm-notice-actions' },
+                emptiesConfirm
+                  ? h(React.Fragment, null,
+                      h('button', { type: 'button', className: 'asm-btn', disabled: emptiesBusy,
+                        onClick: function () { setEmptiesConfirm(false); } }, '再想想'),
+                      h('button', { type: 'button', className: 'asm-btn asm-btn-danger', disabled: emptiesBusy,
+                        onClick: doDeleteEmpties }, emptiesBusy ? '删除中…' : '确认删除'))
+                  : h('button', { type: 'button', className: 'asm-btn',
+                      disabled: emptiesBusy, onClick: function () { setEmptiesConfirm(true); } }, '清理空会话')))
+          : null,
+        emptiesError
+          ? h('p', { className: 'asm-status asm-status-err' },
+              '空会话预览不可用（宿主 /empty-sessions 路由无响应）：' + emptiesError)
           : null,
         // 子智能体污染提示：子智能体不该占用用户工作区的归属记账槽位
         // （侧栏也不把它们显示为列表行，只在父会话上以计数徽标出现）。

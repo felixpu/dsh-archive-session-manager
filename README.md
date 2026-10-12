@@ -6,6 +6,7 @@
 - **设置 → 归档会话**：独立设置页，列出全部归档会话（标题 / 时间 / 目录 / 磁盘占用），支持**多选、全选、批量删除、批量取消归档**与刷新。
 - **归位失效会话**：把「磁盘上有、但不在任何工作区记账里」的会话（它们会显示在侧栏「未分组」）重新挂回 cwd 对应的工作区。只修归属，不删文件；子智能体会被自动跳过（侧栏本就不显示它们）。
 - **一键摘除误记账的子智能体**：子智能体不该占用用户工作区的归属槽位（侧栏也不把它们显示为列表行，只在父会话上以计数徽标出现）。若历史版本把子智能体挂进了记账，这里可一键摘除，只改记账、不动磁盘。
+- **清理遗留空会话**：找出「建了但从未有过对话」（事件里没有任何 `user/message`）的历史会话目录并永久删除。**这是唯一会真删文件的功能**，因此走两步确认，且宿主会**二次校验**——任何有对话内容的会话一律拒删（判据在服务端重算，不信任前端传来的 id）。
 
 入口放在设置页而非侧栏：这是低频的批量维护操作，不是会话内的日常动作。
 
@@ -95,7 +96,7 @@ const sessionIds = changed.sessionIds.filter((id) => this.host.sessionPath(id) =
 
 | 半身 | 文件 | 职责 |
 |---|---|---|
-| 宿主 | `lib/index.js` | 五条同源路由：`GET /api/dsh-archive-session-manager/list`（列出归档会话 + 工作区 + 幽灵记账）、`POST .../delete`（校验 → 删目录 → **live 会话保留归档态与归属 / 冷会话 `detachSession` 摘记账** → 发 `api-session/removed` 通知前端即时移除行）、`POST .../cleanup-ghosts`（清理磁盘已无却仍留在记账里的历史遗留）、`POST .../repair`（把「磁盘有、记账无」的会话用 `attachSession` 归位，**跳过子智能体**，支持 `dryRun` 预览；不删任何文件）、`POST .../detach-subagents`（把被误记账的子智能体从工作区归属中摘除，只改记账不动磁盘） |
+| 宿主 | `lib/index.js` | 六条同源路由：`GET .../list`（列出归档会话 + 工作区 + 幽灵记账）、`POST .../delete`（校验 → 删目录 → **live 会话保留归档态与归属 / 冷会话 `detachSession` 摘记账** → 发 `api-session/removed`）、`POST .../cleanup-ghosts`（清理磁盘已无却仍留在记账里的历史遗留）、`POST .../repair`（把「磁盘有、记账无」的会话用 `attachSession` 归位，**跳过子智能体**，支持 `dryRun`；不删文件）、`POST .../detach-subagents`（把被误记账的子智能体从工作区归属摘除，只改记账）、`POST .../empty-sessions`（列出/删除**从未有过对话**的遗留空会话；会真删目录，但服务端二次校验、拒删有内容的会话） |
 | 客户端 | `client/client.js` | ① `sidebar.workspaces.session.menu.item` 注册「删除会话」（order 500，danger 样式，仅归档行可见）② `settings.section` 注册「归档会话」设置页（order 65，按工作区分组的批量管理正文，另含「归位失效会话」「一键摘除误记账的子智能体」两个维护入口）③ `shell.overlay` 注册单个删除的确认对话框 |
 
 ## 已知坑（开发时实测）
@@ -106,5 +107,21 @@ const sessionIds = changed.sessionIds.filter((id) => this.host.sessionPath(id) =
   现在 `inject` 声明全部四个服务，且读取失败**向上抛**（不再吞异常）。
 - Cordis 的 `inject` 对象形式是「服务名 → 拦截配置」，不是 `{ required, optional }`
   （依据 `cordis/lib/types/registry.d.ts` 的 `Inject` 定义），所以只能用数组形式。
+- **「拼出来的路径」≠「磁盘上存在」**：`sessionDirFor()` 只按 `projectKey(cwd)+id`
+  **拼**路径，磁盘早删了它也不返回 null。曾把 `orphan: dir === null` 当判据 →
+  删除后条目在归档页以「0 B」普通行停留、且反复点删除**原地空转**。
+  凡判「磁盘上有没有」，必须真的 `existsSync`/`stat`。
+- **会话日志是多帧 zstd，`zstdDecompressSync(整个 Buffer)` 只解第一帧**：
+  实测一个 1.2 MB 的 `session.v4.jsonl.zstd` 含 **826 帧**，只解首帧仅得 288 字节 header，
+  会把**有真实对话的会话误判成空会话**。凡需「全部事件」的判断（如是否为空会话）
+  必须逐帧解（见 `readLogText`）。
+- **不要照抄平台的 `CANONICAL_LOG_FILENAME` 去扫磁盘**：平台那个常量
+  （`dsh-session-format/lib/index.js:464`）匹配的是**逻辑名**（无压缩后缀），
+  磁盘上的**物理名**要再拼 `.zstd`（由 `dsh-session-persistence-jsonl/lib/index.js:747-763`
+  的 `logSuffix`/`generationLogFilename` 负责）。照抄会导致匹配恒为空、扫描结果 0，
+  **失败表现为成功**且 `node --check` 照样通过。
+- **子智能体（`origin === 'subagent'`）永远不显示为列表行**
+  （`sessionVisible`，`dsh-client-ui-workspace/lib/client.js:981`），所以它们与
+  「未分组」无关，归位时必须排除；它们只是不该占用工作区的归属记账槽位。
 
 许可证：MIT
