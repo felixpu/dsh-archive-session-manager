@@ -516,7 +516,7 @@ window.__ModuleLoader__.load({
           var parts = ['已删除 ' + okIds.size + ' 个会话'];
           if (freed) parts.push('释放 ' + freed);
           if (cleaned > 0) parts.push('其中 ' + cleaned + ' 个仅清理了归档记录（磁盘已无文件）');
-          // 关于 live 会话的如实告知（2026-10-12 二修）。
+          // 关于 live 会话的如实告知。
           // 平台会把「本进程内存中仍存活的会话」并入列表（sessionQuery.listSessions
           // 用 ctx.sessions.list() 覆盖合并），所以只删磁盘文件、不驱逐内存态，
           // 刷新页面它仍会被列出来。宿主侧现在会**先驱逐内存态**
