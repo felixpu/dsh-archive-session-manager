@@ -22,21 +22,45 @@ dsh plugin --profile web add github:felixpu/dsh-archive-session-manager
 - 只有**正在执行任务**（`agent.status === 'running'`）的会话拒绝删除；被打开过但处于 idle 的会话允许删除（它只是常驻内存，并没有进行中的写入）。
 - 会话目录路径严格限制在 `$DSH_HOME/sessions/` 之下并做前缀校验。
 
-## 平台局限（如实告知）
+## 平台局限（如实告知，已逐一核对官方 Service 契约）
 
-- DSH 平台目前**没有官方的删除会话 API**（`workspaceRegistry` / `sessionPersistence` 均无）。本插件的删除 = 删磁盘会话目录 + 从工作区记账摘除（`detachSession`）+ 从归档集合移除。
-- **被打开过的会话，磁盘文件删掉后仍会被平台列出**：
-  平台把「当前进程内打开的会话」常驻在 `ctx.sessions` 内存注册表里，而会话列表
-  （`sessionQuery.listSessions`，`dsh-session-query/lib/index.js:95-116`）会**先用磁盘
-  持久化结果、再用内存 live 会话覆盖合并** —— 于是磁盘文件即使已被删除，
-  只要该会话在本进程内仍是 live，刷新页面时平台就会把它重新列出来。
-  **这不是插件能修的**：平台的 `AgentRegistry` / `SessionStore` 没有对外暴露销毁入口
-  （`AgentHandle.dispose()` / `detachEntered` 只属于创建方持有的 capability，
-  `dsh-session/lib/index.js:1882-1888`）。
-  **本插件的处理**：对这类 live 会话**保留归档标记、且不摘记账** —— 归档标记让它被
-  侧栏的归档过滤器隐藏（不会掉进「未分组」），记账保留让它保持归属。
-  **应对：重启 DSH 即彻底消失**（重启后内存态重建，只以磁盘为准）。插件会在删除结果里
-  明确提示这一点。
+**DSH 平台没有「删除会话」这个动作。** 这不是猜测，是逐个方法核对的结论：
+
+| 服务 | 方法 | 有删除会话吗 |
+|---|---|---|
+| `sessionPersistence` | `create` / `open` / `flush` / `stat` / `list` | ❌ |
+| `sessionController`（Remote） | `list` / `search` / `create` / `rename` / `fork` / `prompt` / `cancel` / `page` / `follow` / `projections` / `control` | ❌ |
+| `workspaceRegistry` | `create` / `delete`（**工作区**）/ `archiveSession` / `unarchiveSession` / `pin` … | ❌ |
+| 客户端 `workspaces` | `create` / `rename` / `delete`（**工作区**）/ `archiveSession` / `unarchiveSession` | ❌ |
+
+会话离开内存的唯一通路是 `AgentHandle.dispose()`，而它是**创建方持有的 capability**
+（`dsh-agent` 契约原文：“The disposer is a CAPABILITY”），第三方插件**拿不到**。
+
+⇒ 本插件的「删除」只能是**三件事的组合近似**：删磁盘目录 + 从归档集合移除 + 从工作区记账
+摘除（`detachSession`）。这个边界决定了下面的行为，**无法通过改进实现绕过**。
+
+### 于是有一个必须如实告知的终态：`pendingRestart`
+
+`sessionQuery.listSessions()`（`dsh-session-query/lib/index.js:95-116`）**先用磁盘持久化
+结果、再用 `ctx.sessions.list()` 内存 live 会话覆盖合并** —— 所以只要会话在本进程内仍
+live，磁盘删掉了它仍会被列出。若此时摘掉归档标记，它就失去「隐藏理由」而落进侧栏
+「未分组」；若保留标记，它会被归档过滤器隐藏（`dsh-client-ui-workspace/lib/client.js:986`），
+侧栏干净，但该标记要等重启才能清。
+
+**本插件的处理（`lib/index.js` 的 delete 路由 + `pruneDeadArchived`）**：
+
+| 场景 | 归档标记 | 工作区记账 | 界面表现 |
+|---|---|---|---|
+| live + 磁盘在 | 保留 | 保留 | 删除后从归档列表消失，转入「待重启」提示 |
+| 冷 + 磁盘在 | 清除 | 清除 | 彻底删除 |
+| **live + 磁盘已无** | **保留** | **保留** | 归入 `pendingRestart`，**不列在归档会话里** |
+| 冷 + 磁盘已无 | 清除 | 清除 | 清理归档记录 |
+
+- `pendingRestart` 的条目**不再出现在归档会话列表**中 —— 否则用户点「删除」那一行
+  原地不动，观感就是「删了又回来了」（这正是实测反馈的根因：删除对 live 会话曾是 no-op）。
+  它们单独显示为一条提示：磁盘已删、不在侧栏、重启 DSH 后清掉标记、无需重复删除。
+- 重启后首次打开面板时，`pruneDeadArchived()` 会把「磁盘无同名目录 **且** 非 live」
+  的归档 id 清出归档集合（扫描失败则**不清**：清归档集合是破坏性动作，信息不全时宁可留着）。
 
 ## 「未分组」的会话从哪来（两个来源，都实测确诊）
 
@@ -57,7 +81,9 @@ No such file）；同时该 id 既不在任何工作区记账里、也不在归�
 
 **修法（已实现）**：宿主的删除流程区分 live / 冷会话 ——
 - **live**：**不** `detachSession`、**不** `unarchiveSession`，保持归档态与归属。
-  归档过滤器会把它隐藏，侧栏干净；重启后彻底消失。
+  归档过滤器会把它隐藏，侧栏干净；重启后由 `pruneDeadArchived()` 清掉标记。
+  ⚠️ 配套要求：这类条目**不能**再出现在归档会话列表里（否则用户点删除毫无变化，
+  观感是「删了又回来」）—— 已改归 `pendingRestart` 单列，见上文。
 - **冷**（不在内存中）：照常 `detachSession` + `unarchiveSession`，干净清理，
   不留下归档集合里的孤儿 id。
 
@@ -96,8 +122,8 @@ const sessionIds = changed.sessionIds.filter((id) => this.host.sessionPath(id) =
 
 | 半身 | 文件 | 职责 |
 |---|---|---|
-| 宿主 | `lib/index.js` | 六条同源路由：`GET .../list`（列出归档会话 + 工作区 + 幽灵记账）、`POST .../delete`（校验 → 删目录 → **live 会话保留归档态与归属 / 冷会话 `detachSession` 摘记账** → 发 `api-session/removed`）、`POST .../cleanup-ghosts`（清理磁盘已无却仍留在记账里的历史遗留）、`POST .../repair`（把「磁盘有、记账无」的会话用 `attachSession` 归位，**跳过子智能体**，支持 `dryRun`；不删文件）、`POST .../detach-subagents`（把被误记账的子智能体从工作区归属摘除，只改记账）、`POST .../empty-sessions`（列出/删除**从未有过对话**的遗留空会话；会真删目录，但服务端二次校验、拒删有内容的会话） |
-| 客户端 | `client/client.js` | ① `sidebar.workspaces.session.menu.item` 注册「删除会话」（order 500，danger 样式，仅归档行可见）② `settings.section` 注册「归档会话」设置页（order 65，按工作区分组的批量管理正文，另含「归位失效会话」「一键摘除误记账的子智能体」两个维护入口）③ `shell.overlay` 注册单个删除的确认对话框 |
+| 宿主 | `lib/index.js` | 六条同源路由 + 启动期清理：`GET .../list`（列出归档会话 + 工作区 + 幽灵记账 + **pendingRestart**）、`POST .../delete`（校验 → 删目录 → **live 会话保留归档态与归属 / 冷会话 `detachSession` 摘记账** → 发 `api-session/removed`）、`POST .../cleanup-ghosts`、`POST .../repair`（`attachSession` 归位，**跳过子智能体**，支持 `dryRun`）、`POST .../detach-subagents`（只改记账）、`POST .../empty-sessions`（列出/删除**从未有过对话**的空会话；服务端二次校验、拒删有内容的）；另有 `pruneDeadArchived()` 在启动后首次列表时清掉「磁盘无、非 live」的垃圾归档标记 |
+| 客户端 | `client/client.js` | ① `sidebar.workspaces.session.menu.item` 注册「删除会话」（order 500，danger 样式，仅归档行可见）② `settings.section` 注册「归档会话」设置页（order 65，按工作区分组的批量管理正文，另含「归位失效会话」「一键摘除误记账的子智能体」「清理遗留空会话」入口，以及 `pendingRestart` 状态提示）③ `shell.overlay` 注册单个删除的确认对话框 |
 
 ## 已知坑（开发时实测）
 
@@ -123,5 +149,13 @@ const sessionIds = changed.sessionIds.filter((id) => this.host.sessionPath(id) =
 - **子智能体（`origin === 'subagent'`）永远不显示为列表行**
   （`sessionVisible`，`dsh-client-ui-workspace/lib/client.js:981`），所以它们与
   「未分组」无关，归位时必须排除；它们只是不该占用工作区的归属记账槽位。
+- **不要让「删除」变成 no-op**（本项目付出最多代价的教训）：为规避某个副作用而
+  保留状态、什么都不改时，**用户界面上必须同步反映「这件事已经做完了」**。
+  曾为阻止 live 会话掉进「未分组」而对它保留归档标记，结果 `/list` 仍把它当普通
+  归档会话列出 —— 用户点删除、那一行原地不动，观感就是「删了又回来」，连查两轮。
+  正确做法：把这类条目从「待办列表」里摘出去，单列成如实的状态说明。
+- **先读官方契约再动手**：本插件的能力边界（平台没有删除会话的 API）是逐条核对
+  `cordis_inspect_query` 的 host/client `Service` 目录 + 各包源码得出的。
+  凭记忆或凭「应该有」去设计，会把平台限制误当成自己的 bug 反复"修"。
 
 许可证：MIT
