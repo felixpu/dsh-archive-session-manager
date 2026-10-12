@@ -39,28 +39,55 @@ dsh plugin --profile web add github:felixpu/dsh-archive-session-manager
 ⇒ 本插件的「删除」只能是**三件事的组合近似**：删磁盘目录 + 从归档集合移除 + 从工作区记账
 摘除（`detachSession`）。这个边界决定了下面的行为，**无法通过改进实现绕过**。
 
-### 于是有一个必须如实告知的终态：`pendingRestart`
+### ⚠️ 关键：live 会话会被**两条内存通路**持续列出
 
-`sessionQuery.listSessions()`（`dsh-session-query/lib/index.js:95-116`）**先用磁盘持久化
-结果、再用 `ctx.sessions.list()` 内存 live 会话覆盖合并** —— 所以只要会话在本进程内仍
-live，磁盘删掉了它仍会被列出。若此时摘掉归档标记，它就失去「隐藏理由」而落进侧栏
-「未分组」；若保留标记，它会被归档过滤器隐藏（`dsh-client-ui-workspace/lib/client.js:986`），
-侧栏干净，但该标记要等重启才能清。
+这是「删了又回来」的真正机制（2026-10-12 按官方文档 + 源码定位）：
 
-**本插件的处理（`lib/index.js` 的 delete 路由 + `pruneDeadArchived`）**：
+1. `sessionQuery.listSessions()` 用 `ctx.sessions.list()` 内存态**覆盖合并**磁盘结果
+   （`dsh-session-query/lib/index.js:107-116`）；
+2. jsonl 后端的 `list()` 还会把 tracker 里 **created-but-never-materialized** 的
+   pending 条目也返回（`dsh-session-persistence-jsonl/lib/index.js:2593-2596`）；
+   该 pending 只在**写句柄 close 且未落盘**时清除（同文件 `:372-378`）。
 
-| 场景 | 归档标记 | 工作区记账 | 界面表现 |
-|---|---|---|---|
-| live + 磁盘在 | 保留 | 保留 | 删除后从归档列表消失，转入「待重启」提示 |
-| 冷 + 磁盘在 | 清除 | 清除 | 彻底删除 |
-| **live + 磁盘已无** | **保留** | **保留** | 归入 `pendingRestart`，**不列在归档会话里** |
-| 冷 + 磁盘已无 | 清除 | 清除 | 清理归档记录 |
+⇒ 一个从未落盘、但一直被打开的会话，**磁盘上没有它的目录，它却每次都被列出来**。
+这正是用户反馈「删除后刷新仍在原空间显示为归档状态」的那类会话：
+删磁盘、摘记账、保留归档标记……**全都没用，因为它根本不在这一层**。
 
-- `pendingRestart` 的条目**不再出现在归档会话列表**中 —— 否则用户点「删除」那一行
-  原地不动，观感就是「删了又回来了」（这正是实测反馈的根因：删除对 live 会话曾是 no-op）。
-  它们单独显示为一条提示：磁盘已删、不在侧栏、重启 DSH 后清掉标记、无需重复删除。
-- 重启后首次打开面板时，`pruneDeadArchived()` 会把「磁盘无同名目录 **且** 非 live」
-  的归档 id 清出归档集合（扫描失败则**不清**：清归档集合是破坏性动作，信息不全时宁可留着）。
+### 修法：调用官方 teardown 边缘，让平台真正忘掉它
+
+官方文档（`reference/subsystems/persistence`）写明销毁语义：
+> 「`session/disposed` 会执行同样的最终排空并关闭句柄」
+
+平台内部 teardown 顺序 = **先摘 agent、再摘 session**：
+
+| 步骤 | 调用 | 效果 |
+|---|---|---|
+| ① | `ctx.agents.store` → `detachEntered(entry)` | 摘掉 agent 半身 |
+| ② | `ctx.sessions.liveEntryFor(s)` → `detachEntered(entry)` | 移出 store、派发 `session/disposed` |
+| ↳ | jsonl 监听 `session/disposed` | 关闭写句柄、清掉 pending 条目 |
+| ↳ | api-session-controller 监听 `session/disposed` | `emit('api-session/removed')` |
+| ↳ | 客户端 `handleSessionRemoved()` | 把该行从列表摘掉 |
+
+`evictLiveSession()` 就做 ①② 两步（全程 try/catch，失败降级为如实告知 + 提示重启）。
+
+**删除顺序（踩过坑）**：必须**先驱逐、再 `rm` 目录**。因为写句柄 `close()` 会先
+`drainLive()` 落盘，而落盘路径会 `mkdir(dir,{recursive:true})`
+（`dsh-session-persistence-jsonl/lib/index.js:199-210` 与 `:660-670`）——
+顺序反了，`rm` 掉的目录会被 close 的 drain **建回来**，会话文件"复活"。
+
+### 四象限行为（隔离实测全部通过）
+
+| 场景 | 驱逐 | 磁盘目录 | 记账/归档 | 结果 |
+|---|---|---|---|---|
+| live + 磁盘在 | ✅ | 删除 | 清除 | 彻底删除，列表即时摘行 |
+| 冷 + 磁盘在 | — | 删除 | 清除 | 彻底删除 |
+| live + 磁盘已无 | ✅ | 无需删 | 清除 | 不再被列出 |
+| 冷 + 磁盘已无 | — | 无需删 | 清除 | 清理归档记录 |
+
+⚠️ 全部走完才是「真的删掉」；任何一步失败都会在 `warnings` 里如实回报，
+并提示重启收敛 —— 绝不静默留一个"点了没反应"的坏状态。
+
+`pruneDeadArchived()` 仍保留：清理历史上遗留的、任何地方都不存在的归档 id。
 
 ## 「未分组」的会话从哪来（两个来源，都实测确诊）
 
@@ -79,13 +106,12 @@ live，磁盘删掉了它仍会被列出。若此时摘掉归档标记，它就�
 No such file）；同时该 id 既不在任何工作区记账里、也不在归档集合里 → 刷新后必然出现在
 「未分组」，与用户截图（标题「疑问」、时间「2 分钟」）完全吻合。
 
-**修法（已实现）**：宿主的删除流程区分 live / 冷会话 ——
-- **live**：**不** `detachSession`、**不** `unarchiveSession`，保持归档态与归属。
-  归档过滤器会把它隐藏，侧栏干净；重启后由 `pruneDeadArchived()` 清掉标记。
-  ⚠️ 配套要求：这类条目**不能**再出现在归档会话列表里（否则用户点删除毫无变化，
-  观感是「删了又回来」）—— 已改归 `pendingRestart` 单列，见上文。
-- **冷**（不在内存中）：照常 `detachSession` + `unarchiveSession`，干净清理，
-  不留下归档集合里的孤儿 id。
+**修法（已实现）**：宿主的删除流程先用 `evictLiveSession()` 让平台真正忘掉该会话
+（见上文「调用官方 teardown 边缘」），再清记账与归档标记 —— 两者对 live / 冷会话
+都执行，不再区分（驱逐成功后摘记账不会让它"回来"）。
+⚠️ 早期版本对 live 会话「保留归档态、什么都不改」，那是个 **no-op**：条目仍被列出，
+用户点删除毫无反应，观感就是「删了又回来」。这也是它在归档页里曾需要 `pendingRestart`
+单列的原因 —— 修好驱逐后不再需要那个终态。
 
 ### 来源二：从未被记账的历史遗留会话（「另外一批老会话」）
 
@@ -122,11 +148,21 @@ const sessionIds = changed.sessionIds.filter((id) => this.host.sessionPath(id) =
 
 | 半身 | 文件 | 职责 |
 |---|---|---|
-| 宿主 | `lib/index.js` | 六条同源路由 + 启动期清理：`GET .../list`（列出归档会话 + 工作区 + 幽灵记账 + **pendingRestart**）、`POST .../delete`（校验 → 删目录 → **live 会话保留归档态与归属 / 冷会话 `detachSession` 摘记账** → 发 `api-session/removed`）、`POST .../cleanup-ghosts`、`POST .../repair`（`attachSession` 归位，**跳过子智能体**，支持 `dryRun`）、`POST .../detach-subagents`（只改记账）、`POST .../empty-sessions`（列出/删除**从未有过对话**的空会话；服务端二次校验、拒删有内容的）；另有 `pruneDeadArchived()` 在启动后首次列表时清掉「磁盘无、非 live」的垃圾归档标记 |
+| 宿主 | `lib/index.js` | 六条同源路由 + 启动期清理：`GET .../list`（列出归档会话 + 工作区 + 幽灵记账 + **pendingRestart**）、`POST .../delete`（校验 → **`evictLiveSession` 驱逐 live 会话** → 删目录 → 清记账与归档 → 发 `api-session/removed`）、`POST .../cleanup-ghosts`、`POST .../repair`（`attachSession` 归位，**跳过子智能体**，支持 `dryRun`）、`POST .../detach-subagents`（只改记账）、`POST .../empty-sessions`（列出/删除**从未有过对话**的空会话；服务端二次校验、拒删有内容的）；另有 `pruneDeadArchived()` 在启动后首次列表时清掉任何地方都不存在的归档 id |
 | 客户端 | `client/client.js` | ① `sidebar.workspaces.session.menu.item` 注册「删除会话」（order 500，danger 样式，仅归档行可见）② `settings.section` 注册「归档会话」设置页（order 65，按工作区分组的批量管理正文，另含「归位失效会话」「一键摘除误记账的子智能体」「清理遗留空会话」入口，以及 `pendingRestart` 状态提示）③ `shell.overlay` 注册单个删除的确认对话框 |
 
 ## 已知坑（开发时实测）
 
+- **删磁盘 ≠ 删除会话**（本项目最大的坑，查了四轮）：live 会话会被
+  `sessionQuery.listSessions`（内存态覆盖合并）**和** jsonl `list()` 的 pending 分支
+  双重列出，所以删磁盘/摘记账/保留归档标记**全都无效**。必须调用官方 teardown 边缘
+  （`detachEntered` → `session/disposed`）。判据：宿主持有 `session.lock` 而目录不存在
+  = 「从未 materialize 的 pending 会话」，是这一类问题最典型的特征。
+- **驱逐必须早于 `rm`**：写句柄 `close()` 会 `drainLive()` 落盘，落盘路径 `mkdir` 会
+  把刚删的目录**建回来**。顺序：驱逐 → 删目录 → 清记账。
+- **读官方文档再动手**：本插件的能力边界与销毁语义（`session/disposed` 会排空并关闭
+  句柄）都写在 `reference/subsystems/session` 与 `/persistence`。此前凭源码猜了四轮，
+  读文档十分钟就定位到根因。
 - **宿主 ctx 是依赖注入代理**：未在 `inject` 里声明的服务，读属性时直接抛
   `cannot get property "<name>" without inject`。第一版只声明了 `webServer`，
   于是 `ctx.workspaceRegistry` 抛错、又被容错分支吞成空集，表现为「管理页打开但一条数据都没有」。
