@@ -222,3 +222,79 @@ const sessionIds = changed.sessionIds.filter((id) => this.host.sessionPath(id) =
    （返回 `application: applied`，但 Node 模块缓存让旧代码继续复用）。
 
 升级后的验证步骤见 [VERIFICATION.md](VERIFICATION.md)。
+
+## 九、客户端文案的国际化（官方 locale 服务）
+
+界面文案**全部走平台官方 locale 服务**，与官方插件同一套机制
+（参考实现：`dsh-client-ui-schedule`、`dsh-restart-autostart`）。
+
+### 三步接线
+
+1. `package.json` 的 `dsh.client.inject` 加 `"@deepseek-ai/dsh-client-locale"`；
+2. 插件对象 `inject` 加 `'locale'`；
+3. `apply` 里注册字典并 `bind`：
+
+```js
+var NS = 'dsh-archive-session-manager';   // ⚠️ 命名空间必须用包名
+ctx.effect(function () {
+  return ctx.locale.register(NS, { zh: zh, en: en });   // 两种语言必须一次给全
+}, 'dsh-archive-session-manager: dictionaries');
+var t = ctx.locale.bind(NS);
+```
+
+### 组件怎么拿到 `t`
+
+**在槽注册里声明 `locale: NS` 即可**，框架会自动把 `t` 合成到组件 props：
+
+```js
+ctx.slots.register({ name: 'settings.section', id: '...', order: 65, locale: NS }, Comp)
+// 组件签名：function Comp(props) { var t = props.t; ... }
+```
+
+依据是渲染器 `dsh-client-ui-renderer/lib/client.js:723-725`：
+`kit["t"] = localeSeat(face, entry.locale)`，并且**locale face 缺失时会抛错**
+（`SlotAssemblyError: entry declares locale namespace ... but no locale face is installed`）。
+
+⚠️ 因此**不要再额外写 `inject: () => ({ t })`** —— 那是冗余：`t` 已经自动合成，
+而手写的那份会掩盖上面那个「locale 插件没装」的明确报错，把问题变成静默的半成品。
+
+### 注册期文案要用 thunk
+
+设置页导航行的 `label` 接受 `string | (() => string)`（`SlotLabel`）。
+**用函数**，导航行每次读取时求值，语言切换后自动跟着变；写死字符串则切换后仍是旧语言：
+
+```js
+label: function () { return t('menu.navLabel'); }
+```
+
+### 文案组织的三条规则
+
+1. **一条消息 = 一个完整句子**，变量用 `{name}` 占位（官方 `Translate` 支持
+   `t(key, params)`，运行时按 `/\{(\w+)\}/g` 替换）。
+   ❌ 不要拆成片段拼接：英文语序与中文不同（`Deleted 3 sessions` vs
+   「已删除 3 个会话」），拼接式无法重排，片段本身也成了待翻译串。
+   本插件据此把 133 条字面量收敛为 **110 条完整消息**。
+2. **平台已有的一律复用 `common` 命名空间**，不要重写：
+   `cancel`(取消/Cancel)、`loading`(加载中…/Loading…)、`unknown`(未知/Unknown) 等 ——
+   查表未命中会自动回落到 `common`。自己再写一遍会与平台文案不一致。
+3. **宿主只回机器可读的 error code，不写自然语言**：文案归客户端所有（可随语言切换），
+   宿主不该知道 UI 语言。客户端用 `code.<error>` 字典键翻译（见 `codeText`）；
+   **绝不能把 code 直接拼进面向用户的句子**，否则会出现「删除失败：not-archived」这种半成品。
+
+### 日期也要本地化
+
+`toLocaleString('zh-CN', …)` 写死区域是 bug —— 英文界面会出现中文格式日期。
+用字典键 `time.locale` 驱动（与官方 `dsh-client-ui-schedule` 同做法）：
+`zh` → `'zh-CN'`，`en` → `'en-US'`。
+
+### 包元数据
+
+`locale/{en,zh}.json` 存插件市场的标题与描述（`{"meta":{"title","description"}}`），
+需在 `package.json` 的 `files` 里带上 `locale`。这与 UI 字典是**两套东西**：
+前者是包清单里的静态元数据，后者是运行时字典。
+
+### 验证
+
+- 字典双语必须**键完全一致**（`register` 的 typed 形式要求成对，运行时不检查键，要自己比）。
+- 桩 React 渲染时，`t` 要按 `entry.options.locale` 合成（模拟 `localeSeat`），
+  再断言「英文界面不含中文」「中文界面不含英文残留」。

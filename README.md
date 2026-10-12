@@ -106,6 +106,15 @@ DSH 平台**没有**会话级删除 API：`sessionPersistence` 只有 `create` /
 判定严格依据会话头里的「这是子智能体」标记，而不是「有父会话字段」——
 后者会把正常的**延续会话**（用户可见、在侧栏有行）误判进来删掉。
 
+## 语言 / Language
+
+本插件界面支持**中文与英文**，跟随平台语言设置：**设置 → 通用 → 语言**。
+切换后界面文案**立即生效**，无需刷新页面或重装插件。
+
+The UI is available in **Chinese and English**, following the platform language
+setting under **Settings → General → Language**. Switching applies immediately —
+no reload or reinstall needed.
+
 ## 常见问题
 
 **删除了，但列表里还有它？**
