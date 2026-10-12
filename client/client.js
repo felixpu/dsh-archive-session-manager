@@ -370,6 +370,19 @@ window.__ModuleLoader__.load({
         });
       }
 
+      /**
+       * 只刷新「已删除待重启」清单，不碰面板其余状态。
+       *
+       * 为什么需要单独一个：删除完成后若不刷新它，那条提示要等用户手动点「刷新」
+       * 或重开面板才出现 —— 用户刚删完看到的仍是"什么也没发生"，正是本轮要消除的观感。
+       * 不能直接调 load()：load() 开头会 setStatus(null)，把刚写好的删除结果提示清掉。
+       */
+      function refreshPendingRestart() {
+        return apiList().then(function (out) {
+          setPendingRestart(((out && out.pendingRestart) || []).filter(function (x) { return !!x; }));
+        }).catch(function () { /* 失败就保持原样，不打扰用户 */ });
+      }
+
       function load() {
         setItems(null); setSel({}); setStatus(null); setConfirming(false); setGhosts(null); setPendingRestart([]);
         apiList().then(function (out) {
@@ -504,6 +517,9 @@ window.__ModuleLoader__.load({
             // 才彻底消失。用 info 呈现（此前用 err 红字，会让用户以为删失败了）。
             ? { kind: 'info', text: parts.join('，') }
             : { kind: 'err', text: '已删除 ' + okIds.size + ' 个，失败 ' + failures.length + ' 个：' + failures[0] });
+          // 有 live 会话被删时，同步刷新「已删除待重启」清单，让那条如实的状态提示
+          // 当场出现（而不是等用户手动刷新，误以为删了没反应）。
+          if (liveCount > 0) refreshPendingRestart();
         } catch (e) {
           setStatus({ kind: 'err', text: '批量删除失败：' + String(e && e.message || e) });
         } finally {
