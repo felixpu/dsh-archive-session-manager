@@ -1,39 +1,19 @@
 # 重启后验证清单
 
-## 一、这轮找到的真正根因（按你给的官方文档定位）
+> 背景机制（真正的根因、`evictLiveSession` 的 teardown 链路、两个顺序坑）
+> **以 [README.md](README.md) 为唯一事实来源** —— 本文只说「怎么验证」，
+> 不再重复那份说明（此前两份各写一遍，已经漂移过一次）。
 
-你给的 `reference/subsystems/session` 与 `/persistence` 两页**非常有用** —— 它们
-直接指向了此前四轮都没看到的机制：
+## 一、一句话概括
 
-**一个 live 会话会被两条内存通路持续列出，删磁盘对它毫无影响：**
+删不掉那个会话，是因为它**从未落盘**、却一直 live 在进程内存里，被**两条内存通路**
+（`sessionQuery` 的内存态覆盖合并 + jsonl 的 pending 表）持续列出 —— 删磁盘对它无效。
+修法是调用平台运行时可达的 teardown 原语（先拆 agent 再拆 session，触发
+`session/disposed`）让平台真正忘掉它。细节见 README。
 
-1. `sessionQuery.listSessions()` 用 `ctx.sessions.list()` 内存态**覆盖合并**磁盘结果
-   （`dsh-session-query/lib/index.js:107-116`）；
-2. jsonl 后端的 `list()` 还会返回 tracker 里 **created-but-never-materialized** 的
-   pending 条目（`dsh-session-persistence-jsonl/lib/index.js:2593-2596`）；
-   该 pending 只在**写句柄 close 且未落盘**时清除（同文件 `:372-378`，`pending` 是
-   `new Map()` 纯内存态）。
+## 二、修法要点（只列与验证相关的两条顺序约束）
 
-你这台机器上那个删不掉的会话（`session-7601ce65-…`）恰好就是这种：
-**磁盘上根本没有它的目录**（从未 materialize），但宿主一直持有它的 `session.lock`。
-所以前几轮我删磁盘、摘记账、保留归档标记……**全都没用，因为它不在那一层。**
-
-官方文档写明的销毁语义（原话）：
-> 「`session/disposed` 会执行同样的最终排空并关闭句柄」
-
-## 二、修法：调用官方 teardown 边缘（`evictLiveSession`）
-
-平台内部 teardown 顺序 = **先摘 agent、再摘 session**：
-
-| 步骤 | 调用 | 效果 |
-|---|---|---|
-| ① | `ctx.agents.store.get(id)` → `detachEntered(entry)` | 摘掉 agent 半身 |
-| ② | `ctx.sessions.get(id)` → `liveEntryFor` → `detachEntered(entry)` | 移出 store、派发 `session/disposed` |
-| ↳ | jsonl 收到 `session/disposed` | 关闭写句柄、**清掉 pending 条目** |
-| ↳ | api-session-controller 收到 | `emit('api-session/removed')` |
-| ↳ | 客户端 `handleSessionRemoved()` | 把该行从列表摘掉 |
-
-删除流程现在按 **驱逐 → 删目录 → 清记账/归档** 执行。两个顺序坑都已处理：
+删除流程固定为 **驱逐 → 删目录 → 清记账/归档**：
 
 - **驱逐必须早于 `rm`**：写句柄 `close()` 会 `drainLive()` 落盘，落盘路径 `mkdir`
   会把刚删的目录建回来。
@@ -44,32 +24,48 @@
 
 ---
 
-## 三、现在需要你做：重启 DSH
+## 三、重启已完成（2026-10-12 15:39 实测通过）
 
-代码已 push（`537da86`）并装进 profile，但宿主进程仍是**旧模块**。
+宿主已重启，新代码已加载，历史残留已清干净 —— **本节的三步均已验证通过**，
+保留作为「以后改了代码要不要重启 / 怎么确认」的可复用判据。
 
 ⚠️ **实测：`plugin_manager` 的 `set_bundle` 开关不能替代重启** —— disable→enable
 返回 `application: applied`，但 Node 模块缓存让旧代码继续复用。**必须真重启。**
 
 ```sh
-# 重启后确认宿主换了新进程
-ps -o pid=,lstart= -p $(pgrep -f "dsh/lib/bin.js web")
+# 查出宿主 PID 与启动时间
+# ⚠️ 不要用 ps -o ... -p $(pgrep -f "dsh/lib/bin.js web")：本机 pgrep -f 匹配单个
+#    argv，而该模式含空格、跨参数，实测无输出 → ps 报 "option requires an argument"。
+ps ax -o pid=,lstart=,command= | grep "lib/bin.js web" | grep -v grep
 ```
 
 ## 第 1 步：确认新代码已加载（版本判据）
 
+⚠️ **判据必须是「只有新版本才有」的特征**。此前写的
+`curl .../list | grep -q pendingRestart` **无效**：`pendingRestart` 字段旧版本
+（`2b515eb` 起）就有，旧模块照样返回 `"pendingRestart":[]`，探测恒为「✓」。
+
+用 `/evict` 路由是否存在来判（它是本版本才加的）：
+
 ```sh
-curl -s http://127.0.0.1:3080/api/dsh-archive-session-manager/list \
-  | grep -q pendingRestart && echo "✓ 新代码已加载" || echo "✗ 仍是旧代码，需重启"
+# 已注册的 POST 路由会正常响应；未注册的路径才回 401。
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  -H 'content-type: application/json' -d '{}' \
+  http://127.0.0.1:3080/api/dsh-archive-session-manager/evict
+# 400 = 路由已注册（新代码）   401 = 路由不存在（旧代码）
 ```
 
-⚠️ **不要用 curl 验 POST 路由**（`/delete`、`/evict`、`/repair` 等）：本机宿主对 POST
-一律回 `401`，且**不存在的路由也回 401**，无法区分。
+⚠️ **已注册的 POST 路由是可以直接 curl 验证的**（这里此前写反了）：实测
+`/delete` 400、`/repair` 200、`/cleanup-ghosts` 200、`/evict` 400、
+`/detach-subagents` 200、`/empty-sessions` 200；只有**未注册**路径回 401。
 
-## 第 2 步：清掉历史残留
+## 第 2 步：清掉历史残留（已自动完成）
 
-那个卡了很久的 `session-7601ce65-…`：重启后它已不在内存（pending 表清空），
-`pruneDeadArchived()` 会在首次打开面板时把它的归档 id 一并清掉。
+那个卡了很久的 `session-7601ce65-…`：重启后它不在内存里了（pending 表随进程重建），
+`pruneDeadArchived()` 在首次打开面板时把它的归档 id 一并清掉。
+
+实测确认（2026-10-12 16:00 左右）：`archivedSessionIds` 已为空、无任何工作区记账它、
+宿主 `/list` 返回 `sessions: 0, pendingRestart: 0, ghosts: 0`。
 
 ## 第 3 步：原样重测你的场景（关键验收）
 
@@ -91,7 +87,7 @@ curl -s http://127.0.0.1:3080/api/dsh-archive-session-manager/list \
 
 ### ⚠️ 顺便确认一件事（可能单独解释你之前看到的现象）
 
-侧栏视图菜单有三档「已归档」筛选（`client.js:2900-2906`）：
+侧栏视图菜单有三档「已归档」筛选（`dsh-client-ui-workspace/lib/client.js:2903-2905`）：
 **隐藏已归档（默认）** / **显示已归档** / **仅已归档**。
 
 如果当时选的是「显示已归档」，那么归档会话本来就**会**显示在侧栏其工作区分组下 ——
@@ -100,7 +96,7 @@ curl -s http://127.0.0.1:3080/api/dsh-archive-session-manager/list \
 ## 第 4 步：确认没有误删
 
 ```sh
-ls ~/.dsh/sessions/*/ | wc -l    # 与操作前对比
+find ~/.dsh/sessions -mindepth 2 -maxdepth 2 -type d | wc -l    # 与操作前对比（统计会话目录数，不是目录内文件数）
 ```
 
 ---
@@ -118,9 +114,13 @@ cd ~/.dsh/profiles/web && pnpm update dsh-archive-session-manager
 
 ## 仍未解决 / 如实告知
 
-- 平台**没有**会话级删除 API（`sessionPersistence` 只有 create/open/stat/list）。
-  本插件的删除始终是「驱逐内存态 + 删磁盘 + 清记账」的组合。
-- `evictLiveSession` 用的是平台**内部 teardown 原语**（运行时可达，但不在公开
-  Service 契约里）。若官方改内部结构，这里需要跟着调整 —— 已用 try/catch 兜底，
-  失败会如实回报并降级为「重启收敛」，不会静默坏掉。
+- 平台的**公开 Service 契约里没有**会话级删除 API（`sessionPersistence` 只有
+  `create` / `open` / `flush` / `stat` / `list`）。本插件的删除始终是
+  「驱逐内存态 + 删磁盘 + 清记账 + 清归档」的组合。
+- `evictLiveSession` 用的是平台**内部 teardown 原语**（`detachEntered` /
+  `liveEntryFor`）。它们在 `.d.ts` 里标 `private`，但**运行时可达**（不是 ES `#`
+  私有字段），故插件可以调用 —— 这也是本插件唯一能真正删掉 live 会话的原因
+  （README 的同一结论已按此更正，两份文档不再互相矛盾）。
+  若官方改内部结构，这里需要跟着调整 —— 已用 try/catch 兜底，失败会如实回报
+  并降级为「提示重启 + 可重试驱逐」，不会静默坏掉。
 - 「重启后收敛」永远是最后兜底：pending 表与内存态都随进程重建。
