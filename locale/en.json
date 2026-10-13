@@ -1,5 +1,6 @@
 {
   "meta": {
+    "title": "Archived sessions",
     "description": "Delete archived sessions, clean up leftovers, and repair workspace accounting for sessions that ended up under “Ungrouped”."
   }
 }
